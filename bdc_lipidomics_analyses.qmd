@@ -1,0 +1,1393 @@
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggrepel)
+library(stringr)
+library(purrr)
+library(tibble)
+library(pheatmap)
+```
+
+```{r}
+# ─────────────────────────────────────
+# 1. Read Entire CSV (Headers + Data)
+# ─────────────────────────────────────
+all_rows <- read_csv("bcd_lipidomics/norm_metabo_lipids.csv", col_names = FALSE)
+
+# ─────────────────────────────────────
+# 2. Split Header Rows and Data Rows
+# ─────────────────────────────────────
+header_rows <- all_rows[1:3, ]
+data_raw <- all_rows[-c(1:3), ]
+
+# ─────────────────────────────────────
+# 3. Identify Column Structure
+# ─────────────────────────────────────
+metadata_cols <- 7
+n_data_cols <- ncol(data_raw)
+measurement_cols <- n_data_cols - metadata_cols
+
+# ─────────────────────────────────────
+# 4. Process and Clean Header Information
+# ─────────────────────────────────────
+header_df <- as.data.frame(t(header_rows[, (metadata_cols + 1):(metadata_cols + measurement_cols)]),
+                           stringsAsFactors = FALSE)
+colnames(header_df) <- c("experiment", "group", "label")
+
+header_df <- header_df %>%
+  fill(experiment, group, .direction = "down") %>%
+  mutate(across(everything(), ~ str_replace_all(., "\\s+", "_"))) %>%
+  mutate(across(everything(), ~ str_replace_all(., "[^A-Za-z0-9_\\-]", ""))) %>%
+  mutate(label_collapsed = str_remove(label, "-\\d+"),
+         base_name_collapsed = paste(experiment, group, label_collapsed, sep = "_")) %>%
+  group_by(base_name_collapsed) %>%
+  mutate(rep_id_collapsed = row_number(),
+         clean_name = paste0(base_name_collapsed, "_rep", rep_id_collapsed)) %>%
+  ungroup()
+
+# ─────────────────────────────────────
+# 5. Assign Clean Column Names
+# ─────────────────────────────────────
+colnames(data_raw)[1:metadata_cols] <- c("compound", "compoundId", "isotopeLabel", "medMz", "medRt", "Polarity", "Group")
+colnames(data_raw)[(metadata_cols + 1):(metadata_cols + measurement_cols)] <- header_df$clean_name
+
+# ─────────────────────────────────────
+# 6. Clean and Convert Data Types
+# ─────────────────────────────────────
+data_cleaned <- data_raw[-1, ]  # Drop repeated column header row
+
+data_cleaned[, (metadata_cols + 1):(metadata_cols + measurement_cols)] <-
+  lapply(data_cleaned[, (metadata_cols + 1):(metadata_cols + measurement_cols)], as.numeric)
+
+data_cleaned <- data_cleaned %>%
+  mutate(
+    medMz = as.numeric(medMz),
+    medRt = as.numeric(medRt),
+    compoundId = as.factor(compoundId),
+    isotopeLabel = as.factor(isotopeLabel),
+    Group = as.factor(Group)
+  )
+
+# ─────────────────────────────────────
+# 7. Output Summary
+# ─────────────────────────────────────
+cat("✅ Cleaned data has", ncol(data_cleaned), "columns and", nrow(data_cleaned), "rows.\n")
+cat("🧪 Measurement columns:", measurement_cols, "\n")
+
+# ─────────────────────────────────────
+# 8. (Optional) Save Cleaned Outputs
+# ─────────────────────────────────────
+write_csv(data_cleaned, "bcd_lipidomics/metabolomics_cleaned.csv")
+write_csv(header_df, "bcd_lipidomics/metabolomics_column_metadata.csv")
+
+```
+
+```{r}
+
+# Create new df with only 'compound' + measurement columns
+data_matrix <- data_cleaned %>%
+  dplyr::select(compound, isotopeLabel, (metadata_cols + 1):(metadata_cols + measurement_cols))
+
+# Replace all negative values with 0 across numeric columns
+data_matrix <- data_matrix %>%
+  mutate(across(where(is.numeric), ~ ifelse(. < 0, 0, .)))
+
+
+```
+
+######## 
+
+# 🔄 Collapse Isotopologues into PARENT vs LABEL Groups
+
+This chunk collapses all isotopologue-specific rows into two biologically meaningful categories: `"PARENT"` (C12-unlabeled) and `"LABEL"` (all C13-labeled variants). It adds a `label_group` column based on the `isotopeLabel`, groups by `compound` and `label_group`, and then sums all numeric sample intensities across replicates. The resulting `data_collapsed` tibble contains one row per compound × label_group combination, summarizing total signal for stable isotope tracing analyses.
+
+```{r}
+# Create new column to group PARENT vs LABEL
+data_collapsed <- data_matrix %>%
+  mutate(label_group = ifelse(isotopeLabel == "C12 PARENT", "PARENT", "LABEL")) %>%
+  group_by(compound, label_group) %>%
+  summarise(across(where(is.numeric), sum, na.rm = TRUE), .groups = "drop")
+```
+
+```{r}
+write.csv(data_collapsed, "bcd_lipidomics/collapse_metabolomics_traced_forprism.csv", row.names = FALSE)
+
+data_collapsed <- read_csv("bcd_lipidomics/collapse_metabolomics_traced_forprism.csv")
+```
+
+# 📈 Genotype-Specific log2 Fold Changes in Experiment 1 (ROSA vs SLC)
+
+This chunk computes and visualizes compound-level log2 fold changes in labeled metabolite uptake between the ROSA and SLC genotypes, specifically within **Experiment 1**. It starts by filtering `data_collapsed` to retain only rows labeled as `"LABEL"`, then applies a log2 transformation (with pseudocount = 1) to stabilize variance. A helper function averages replicate columns for each genotype (`ROSA`, `SLC`) and background (`C`, `P`) across both compartments (`Media`, `Cells`). For each `C` and `P` background, the chunk computes the log2 difference `ROSA − SLC`, storing the contrasts separately for Media and Cells. Finally, it visualizes these contrasts as unclustered heatmaps to reveal compound-specific shifts in tracer incorporation due to genotype differences. Importantly, this chunk **only uses Experiment 1 columns** and ignores any Experiment 2 data that may be present in `data_collapsed`.
+
+```{r}
+# ---- Define genotype groups ----
+# We compare: C_ROSA vs C_SLC, and P_ROSA vs P_SLC
+genotype_pairs <- list(
+    C = list(group1 = "C_SLC", group2 = "C_ROSA"),
+    P = list(group1 = "P_SLC", group2 = "P_ROSA")
+)
+
+# ---- Filter labeled metabolites ----
+data_labeled <- data_collapsed %>%
+    filter(label_group == "LABEL")
+
+# ---- Log2 transform with pseudocount ----
+log_data <- data_labeled
+log_data[, -c(1, 2)] <- log2(log_data[, -c(1, 2)] + 1)
+
+# ---- Function to average replicates per genotype and condition ----
+average_condition <- function(df, genotype, condition_pattern) {
+    cols <- grep(condition_pattern, names(df), value = TRUE)
+    cols <- cols[str_detect(cols, genotype)]
+    rowMeans(df[, cols, drop = FALSE], na.rm = TRUE)
+}
+
+# ---- Initialize lists for storing contrasts ----
+media_contrasts <- list()
+cells_contrasts <- list()
+
+# ---- Loop over genotype pairs ----
+for (grp in names(genotype_pairs)) {
+    g1 <- genotype_pairs[[grp]]$group1  # SLC
+    g2 <- genotype_pairs[[grp]]$group2  # ROSA
+    
+    # --- MEDIA condition ---
+    media_df <- log_data %>%
+        transmute(
+            compound,
+            SLC = average_condition(., g1, "^Experiment_1_Media_"),
+            ROSA = average_condition(., g2, "^Experiment_1_Media_")
+        ) %>%
+        mutate(diff = ROSA - SLC) %>%
+        arrange(desc(diff)) %>%
+        select(compound, diff) %>%
+        column_to_rownames("compound")
+    
+    media_contrasts[[grp]] <- media_df
+    
+    # --- CELLS condition ---
+    cells_df <- log_data %>%
+        transmute(
+            compound,
+            SLC = average_condition(., g1, "^Experiment_1_Cells_"),
+            ROSA = average_condition(., g2, "^Experiment_1_Cells_")
+        ) %>%
+        mutate(diff = ROSA - SLC) %>%
+        arrange(desc(diff)) %>%
+        select(compound, diff) %>%
+        column_to_rownames("compound")
+    
+    cells_contrasts[[grp]] <- cells_df
+}
+
+# ---- Plot heatmaps ----
+
+# Media: C_ROSA vs C_SLC
+pheatmap(media_contrasts$C,
+         cluster_rows = FALSE, cluster_cols = FALSE,
+         main = "📊 Media – log2FC: C_ROSA vs C_SLC",
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         legend = TRUE)
+
+# Media: P_ROSA vs P_SLC
+pheatmap(media_contrasts$P,
+         cluster_rows = FALSE, cluster_cols = FALSE,
+         main = "📊 Media – log2FC: P_ROSA vs P_SLC",
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         legend = TRUE)
+
+# Cells: C_ROSA vs C_SLC
+pheatmap(cells_contrasts$C,
+         cluster_rows = FALSE, cluster_cols = FALSE,
+         main = "📊 Cells – log2FC: C_ROSA vs C_SLC",
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         legend = TRUE)
+
+# Cells: P_ROSA vs P_SLC
+pheatmap(cells_contrasts$P,
+         cluster_rows = FALSE, cluster_cols = FALSE,
+         main = "📊 Cells – log2FC: P_ROSA vs P_SLC",
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         legend = TRUE)
+
+
+```
+
+### 📈 Quadrant Plot Comparison of Genotype Effects Across Backgrounds (Experiment 1)
+
+This chunk generates **quadrant scatter plots** comparing the log2 fold change (ROSA vs SLC) in tracer uptake between the `C` and `P` genetic backgrounds for both **Media** and **Cells** in **Experiment 1**. It begins by merging the previously computed contrasts for `C` and `P` backgrounds from `media_contrasts` and `cells_contrasts`, respectively, while cleaning compound names to remove leading numeric IDs. A custom plotting function, `plot_fc_comparison()`, visualizes each compound as a point in log2FC space, with a diagonal reference line (identity) and coloring based on overall FC magnitude. Compounds showing large divergence between backgrounds (`|C − P| > 2`) are labeled. The plots highlight how tracer incorporation patterns differ across backgrounds, revealing condition-specific or genotype-background interaction effects. Finally, the plots are saved as high-resolution PDF files (`600 dpi`) for publication-ready output in the `experiment_1_plots/` directory.
+
+```{r}
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(tibble)
+
+# ─────────────────────────────────────────────
+# 🧼 Function to remove leading numeric IDs
+# ─────────────────────────────────────────────
+clean_compound_name <- function(name) {
+  str_trim(str_remove(name, "^[0-9]+\\s+"))
+}
+
+# ─────────────────────────────────────────────
+# 📊 Merge Media log2FC and clean compound names
+# ─────────────────────────────────────────────
+media_fc_combined <- media_contrasts$C %>%
+  rename(C = diff) %>%
+  rownames_to_column("compound") %>%
+  inner_join(
+    media_contrasts$P %>%
+      rename(P = diff) %>%
+      rownames_to_column("compound"),
+    by = "compound"
+  ) %>%
+  mutate(compound = clean_compound_name(compound))
+
+# 📊 Merge Cells log2FC and clean compound names
+cells_fc_combined <- cells_contrasts$C %>%
+  rename(C = diff) %>%
+  rownames_to_column("compound") %>%
+  inner_join(
+    cells_contrasts$P %>%
+      rename(P = diff) %>%
+      rownames_to_column("compound"),
+    by = "compound"
+  ) %>%
+  mutate(compound = clean_compound_name(compound))
+
+# ─────────────────────────────────────────────
+# 📈 Aesthetic Plot Function
+# ─────────────────────────────────────────────
+plot_fc_comparison <- function(df, title) {
+  max_range <- max(abs(c(df$C, df$P)), na.rm = TRUE)
+  
+  ggplot(df, aes(x = C, y = P)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray70") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray70") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "firebrick") +
+    geom_point(aes(color = sqrt(C^2 + P^2)), size = 3, alpha = 0.85) +
+    scale_color_gradient2(
+      low = "blue", mid = "gray85", high = "red", midpoint = 0,
+      name = "Magnitude\nlog2FC"
+    ) +
+    geom_text_repel(
+      data = df %>% filter(abs(C - P) > 2),
+      aes(label = compound),
+      size = 3.2, max.overlaps = 10, box.padding = 0.35, seed = 42
+    ) +
+    coord_fixed(xlim = c(-max_range, max_range), ylim = c(-max_range, max_range)) +
+    labs(
+      title = title,
+      x = "log2FC in C background (ROSA - SLC)",
+      y = "log2FC in P background (ROSA - SLC)"
+    ) +
+    theme_classic(base_size = 15) +
+    theme(
+      plot.title = element_text(face = "bold", size = 16),
+      legend.position = "right"
+    )
+}
+
+# ─────────────────────────────────────────────
+# 📊 Plot Media
+# ─────────────────────────────────────────────
+plot_fc_comparison(media_fc_combined, "📈 Media – log2FC(ROSA vs SLC): C vs P")
+
+# 📊 Plot Cells
+plot_fc_comparison(cells_fc_combined, "📈 Cells – log2FC(ROSA vs SLC): C vs P")
+
+
+# ─────────────────────────────────────────────
+# 💾 Save log2FC comparison plots (Media + Cells)
+# ─────────────────────────────────────────────
+
+# 📁 Ensure output directory exists
+output_dir <- "experiment_1_plots"
+if (!dir.exists(output_dir)) dir.create(output_dir)
+
+# 📊 Generate plots
+plot_media_fc <- plot_fc_comparison(media_fc_combined, "📈 Media – log2FC(ROSA vs SLC): C vs P")
+plot_cells_fc <- plot_fc_comparison(cells_fc_combined, "📈 Cells – log2FC(ROSA vs SLC): C vs P")
+
+# 🖨️ Save as high-resolution PDF
+ggsave(
+  filename = file.path(output_dir, "log2FC_Media_C_vs_P_ROSA_vs_SLC.pdf"),
+  plot = plot_media_fc,
+  device = "pdf",
+  width = 8,
+  height = 6,
+  dpi = 600,
+  units = "in",
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(output_dir, "log2FC_Cells_C_vs_P_ROSA_vs_SLC.pdf"),
+  plot = plot_cells_fc,
+  device = "pdf",
+  width = 8,
+  height = 6,
+  dpi = 600,
+  units = "in",
+  bg = "white"
+)
+
+```
+
+### 🔥 Heatmap Visualization of Tracer Uptake in Selected Fatty Acids (Experiment 1, LABEL group)
+
+This chunk generates row-normalized (z-score) heatmaps to visualize the relative incorporation of C13-labeled fatty acid tracers across genotypes and backgrounds, focusing exclusively on **Experiment 1** and the **LABEL group**. It begins by selecting a subset of biologically relevant compounds using case-insensitive matching for known fatty acid names (`linoleate`, `octadecenoic`, `hexadecanoic`). It then filters out all `CONTROL` and `NO_LABEL` columns and defines custom ordering for sample columns by background (`P` vs `C`) and genotype (`ROSA` vs `SLC`). For both Media and Cells, it calculates the mean log2-transformed intensity per condition, constructs matrices with consistent rownames, and applies row-wise z-score scaling to highlight relative changes across conditions within each compound. The result is two heatmaps—one for Media and one for Cells—emphasizing condition-specific variation in labeled fatty acid uptake across the four biological groups: `P_ROSA`, `P_SLC`, `C_ROSA`, and `C_SLC`.
+
+```{r}
+# ─────────────────────────────────────────────
+# 📦 Load required libraries
+# ─────────────────────────────────────────────
+library(dplyr)
+library(stringr)
+library(tibble)
+library(pheatmap)
+library(purrr)
+
+# ─────────────────────────────────────────────
+# 🔁 Define compound targets using case-insensitive matching
+# ─────────────────────────────────────────────
+compound_synonyms <- c("linoleate", "octadecenoic", "hexadecanoic")
+
+# Filter only LABEL data (tracer incorporation)
+log_data_labeled <- log_data %>%
+    filter(label_group == "LABEL")
+
+# Match rows using substring (case-insensitive)
+log_data_filtered <- log_data_labeled %>%
+    filter(str_detect(tolower(compound), str_c(compound_synonyms, collapse = "|")))
+
+# 🧪 Confirm matches
+cat("✅ Matched compounds:\n")
+print(log_data_filtered$compound)
+
+# ─────────────────────────────────────────────
+# 🔍 Remove control / NO_LABEL columns
+# ─────────────────────────────────────────────
+log_data_cleaned <- log_data_filtered %>%
+    select(-matches("no[_]?label|control", ignore.case = TRUE))
+
+# ─────────────────────────────────────────────
+# 🧬 Column Ordering
+# ─────────────────────────────────────────────
+order_priority <- c("P_ROSA", "P_SLC", "C_ROSA", "C_SLC")
+
+get_ordered_cols <- function(colnames_vector, prefix) {
+    colnames_vector %>%
+        keep(~ str_detect(., paste0("^", prefix))) %>%
+        .[order(match(str_extract(., str_c(order_priority, collapse = "|")), order_priority))]
+}
+
+media_cols_ordered <- get_ordered_cols(colnames(log_data_cleaned), "Experiment_1_Media_")
+cells_cols_ordered <- get_ordered_cols(colnames(log_data_cleaned), "Experiment_1_Cells_")
+
+# ─────────────────────────────────────────────
+# 🎯 Construct matrix with rownames
+# ─────────────────────────────────────────────
+log_data_matrix <- log_data_cleaned %>%
+    column_to_rownames("compound")
+
+# ─────────────────────────────────────────────
+# 🧮 Averaged expression per condition
+# ─────────────────────────────────────────────
+average_by_condition <- function(mat, cols) {
+    rowMeans(mat[, cols, drop = FALSE], na.rm = TRUE)
+}
+
+avg_expr_media <- data.frame(
+    P_ROSA = average_by_condition(log_data_matrix, media_cols_ordered[str_detect(media_cols_ordered, "P_ROSA")]),
+    P_SLC  = average_by_condition(log_data_matrix, media_cols_ordered[str_detect(media_cols_ordered, "P_SLC")]),
+    C_ROSA = average_by_condition(log_data_matrix, media_cols_ordered[str_detect(media_cols_ordered, "C_ROSA")]),
+    C_SLC  = average_by_condition(log_data_matrix, media_cols_ordered[str_detect(media_cols_ordered, "C_SLC")])
+)
+
+avg_expr_cells <- data.frame(
+    P_ROSA = average_by_condition(log_data_matrix, cells_cols_ordered[str_detect(cells_cols_ordered, "P_ROSA")]),
+    P_SLC  = average_by_condition(log_data_matrix, cells_cols_ordered[str_detect(cells_cols_ordered, "P_SLC")]),
+    C_ROSA = average_by_condition(log_data_matrix, cells_cols_ordered[str_detect(cells_cols_ordered, "C_ROSA")]),
+    C_SLC  = average_by_condition(log_data_matrix, cells_cols_ordered[str_detect(cells_cols_ordered, "C_SLC")])
+)
+
+rownames(avg_expr_media) <- rownames(log_data_matrix)
+rownames(avg_expr_cells) <- rownames(log_data_matrix)
+
+# ─────────────────────────────────────────────
+# 🔄 Row-scale (z-score) function
+# ─────────────────────────────────────────────
+scale_rows <- function(mat) {
+    t(scale(t(mat)))  # scale each row (compound) to mean=0, sd=1
+}
+
+# ─────────────────────────────────────────────
+# 🔥 HEATMAP: Row-normalized (z-score) – Media
+# ─────────────────────────────────────────────
+pheatmap(
+    mat = scale_rows(as.matrix(avg_expr_media)),
+    main = "🔥 Row Z-Score – MEDIA (LABEL group only)",
+    cluster_rows = FALSE, cluster_cols = FALSE,
+    color = colorRampPalette(c("blue", "white", "red"))(100),
+    fontsize_row = 12
+)
+
+# ─────────────────────────────────────────────
+# 🔥 HEATMAP: Row-normalized (z-score) – Cells
+# ─────────────────────────────────────────────
+pheatmap(
+    mat = scale_rows(as.matrix(avg_expr_cells)),
+    main = "🔥 Row Z-Score – CELLS (LABEL group only)",
+    cluster_rows = FALSE, cluster_cols = FALSE,
+    color = colorRampPalette(c("blue", "white", "red"))(100),
+    fontsize_row = 12
+)
+
+```
+
+# Scatter plots 3 lipids
+
+## 🧪 Scatter Plot of Z-Scored Tracer Uptake Across Media vs Cells (Replicate-Level, Experiment 1)
+
+This section visualizes relative tracer uptake across Media and Cells for three target fatty acids—**Linoleate**, **Hexadecanoic acid**, and **Octadecenoic acid**—by plotting **z-scored** replicate-level intensities from **Experiment 1**. It begins by filtering the `data_collapsed` matrix to retain only rows corresponding to the LABEL group and target compounds, then reshapes the dataset into long format while parsing metadata such as genotype (ROSA vs SLC), background (Media vs Cells), and population (C vs P). It computes **within-compound and background-specific z-scores**, ensuring comparability across samples despite scale differences. Replicate-level duplicates are detected and collapsed via mean z-score. The resulting data is then reshaped into wide format (Cells vs Media) and visualized using fixed-axis scatter plots, where each point represents a replicate colored by genotype and shaped by background. These z-score plots emphasize **relative changes in tracer incorporation patterns**, independent of absolute signal intensity, making them useful for detecting genotype-background interaction effects.
+
+```{r}
+# ─────────────────────────────────────────────
+# 🧼 Clean compound names
+# ─────────────────────────────────────────────
+clean_compound_name <- function(name) {
+  str_trim(str_remove(name, "^[0-9]+\\s+"))
+}
+
+# ─────────────────────────────────────────────
+# 🔄 Rebuild as rep_data_long_second
+# ─────────────────────────────────────────────
+target_lipids <- c("Hexadecanoic acid", "Octadecenoic acid", "Linoleate")
+
+rep_data_long <- data_collapsed %>%
+  # Step 1: Keep only LABEL group + Experiment 1 columns
+  filter(label_group == "LABEL") %>%
+  select(compound, starts_with("Experiment_1")) %>%
+  mutate(compound_clean = clean_compound_name(compound)) %>%
+  filter(compound_clean %in% target_lipids) %>%
+
+  # Step 2: Pivot to long format
+  pivot_longer(
+    cols = starts_with("Experiment_1"),
+    names_to = "sample",
+    values_to = "value"
+  ) %>%
+  mutate(value = as.numeric(value)) %>%
+
+  # Step 3: Parse genotype + background from sample name
+  mutate(
+    genotype = case_when(
+      str_detect(sample, "_ROSA_") ~ "ROSA",
+      str_detect(sample, "_SLC_") ~ "SLC",
+      TRUE ~ NA_character_
+    ),
+    background = case_when(
+      str_detect(sample, "_Cells_") ~ "Cells",
+      str_detect(sample, "_Media_") ~ "Media",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+
+  # Step 4: Remove ambiguous samples
+  filter(!is.na(genotype), !is.na(background)) %>%
+
+  # Step 5: Z-score within compound × background
+  group_by(compound_clean, background) %>%
+  mutate(z_score = scale(value)[, 1]) %>%
+  ungroup()
+
+
+
+
+# ─────────────────────────────────────────────
+# 🧼 Helper: Clean compound name
+# ─────────────────────────────────────────────
+clean_compound_name <- function(name) {
+    str_trim(str_remove(name, "^[0-9]+\\s+"))
+}
+
+# ─────────────────────────────────────────────
+# 🛠️ Step 1: Prepare replicates + group ID
+# ─────────────────────────────────────────────
+rep_data_debug <- rep_data_long %>%
+    mutate(
+        replicate = str_extract(sample, "rep[0-9]+"),
+        population = case_when(
+            str_detect(sample, "_P_") ~ "P",
+            str_detect(sample, "_C_") ~ "C",
+            TRUE ~ NA_character_
+        ),
+        sample_group = paste(compound_clean, genotype, replicate, sep = "_")
+    )
+
+
+# ─────────────────────────────────────────────
+# 🧪 Step 2: Check for duplicates
+# ─────────────────────────────────────────────
+dup_check <- rep_data_debug %>%
+    group_by(compound_clean, sample_group, genotype, background) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    filter(n > 1)
+
+cat("🔍 Duplicate entries found (Z-score input):\n")
+print(dup_check)
+
+# ─────────────────────────────────────────────
+# 💡 Step 3: Collapse duplicates by mean Z-score
+# ─────────────────────────────────────────────
+rep_data_summarised_z <- rep_data_debug %>%
+    group_by(compound_clean, sample_group, genotype, background, population, replicate) %>%
+    summarise(z_score = mean(z_score, na.rm = TRUE), .groups = "drop")
+
+# ─────────────────────────────────────────────
+# 🔄 Step 4: Pivot to wide format (Cells vs Media)
+# ─────────────────────────────────────────────
+rep_data_wide_z <- rep_data_summarised_z %>%
+    pivot_wider(
+        names_from = background,
+        values_from = z_score
+    ) %>%
+    filter(!is.na(Cells) & !is.na(Media))  # ✅ Only remove NAs; keep 0s
+
+# ─────────────────────────────────────────────
+# 🧪 Step 5: Final check
+# ─────────────────────────────────────────────
+cat("✅ Final z-scored dataset for scatter plotting (16 rows expected):\n")
+print(dim(rep_data_wide_z))
+print(head(rep_data_wide_z))
+
+
+
+plot_lipid_zscore <- function(df, compound_name) {
+    lipid_df <- df %>% filter(compound_clean == compound_name)
+
+    cat(glue::glue("\n🎯 Plotting {compound_name} (z-score):\n"))
+    print(dim(lipid_df))
+
+    ggplot(lipid_df, aes(x = Media, y = Cells)) +
+        geom_point(aes(color = genotype, shape = population), size = 4.5) +
+        geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "gray50", linewidth = 0.8) +
+        scale_x_continuous(expand = expansion(mult = 0.05)) +
+        scale_y_continuous(expand = expansion(mult = 0.05)) +
+        coord_fixed() +
+        labs(
+            title = glue::glue("Tracer Uptake — {compound_name} (Z-score)"),
+            x = "Media (Z-score)",
+            y = "Cells (Z-score)",
+            color = "Genotype",
+            shape = "Population"
+        ) +
+        theme_minimal(base_size = 15) +
+        theme(
+            plot.title = element_text(face = "bold"),
+            legend.position = "bottom"
+        )
+}
+
+
+
+
+plot_lipid_zscore(rep_data_wide_z, "Linoleate")
+plot_lipid_zscore(rep_data_wide_z, "Hexadecanoic acid")
+plot_lipid_zscore(rep_data_wide_z, "Octadecenoic acid")
+
+
+# 📁 Create output directory (if it doesn't exist)
+output_dir <- "experiment_1_plots"
+if (!dir.exists(output_dir)) dir.create(output_dir)
+
+# 🧼 Vector of lipid names
+lipids <- c("Linoleate", "Hexadecanoic acid", "Octadecenoic acid")
+
+# 🖼️ Save each plot as a high-res PDF (z-scored)
+for (lipid in lipids) {
+    plot_obj <- plot_lipid_zscore(rep_data_wide_z, lipid)
+    
+    # Construct clean filename
+    file_safe_name <- gsub(" ", "_", lipid)
+    filename <- paste0(output_dir, "/", file_safe_name, "_zScored.pdf")
+    
+    # Save plot
+    ggsave(
+        filename = filename,
+        plot = plot_obj,
+        device = "pdf",
+        width = 7,
+        height = 7,
+        dpi = 600,
+        units = "in",
+        bg = "white"
+    )
+}
+
+
+```
+
+## 🧪 Scatter Plot of Raw log2 Intensities for Tracer Uptake (Replicate-Level, Experiment 1)
+
+This section generates replicate-level scatter plots of **raw log2-transformed intensities** (no z-scoring) for the same three fatty acids—**Linoleate**, **Hexadecanoic acid**, and **Octadecenoic acid**—again across Media vs Cells using **Experiment 1** data. It filters for LABEL-only rows, selects target compounds by keyword matching, removes CONTROL and NO_LABEL samples, and extracts relevant metadata (genotype, population, replicate ID). After reshaping to long and then wide format (Cells vs Media), it constructs scatter plots for each compound where each dot represents a replicate, colored by genotype and shaped by population background. Unlike the z-score version, these plots preserve **absolute intensity differences**, enabling direct interpretation of raw uptake magnitude across experimental groups. This is particularly helpful for evaluating real biological uptake levels and detecting whether group differences are driven by relative or absolute tracer incorporation.
+
+```{r}
+# ─────────────────────────────────────────────
+# 📦 Libraries
+# ─────────────────────────────────────────────
+
+# ─────────────────────────────────────────────
+# 🎯 Step 0: Target compound list
+# ─────────────────────────────────────────────
+compound_synonyms <- c("linoleate", "octadecenoic", "hexadecanoic")
+cat("🎯 Target compound keywords:\n")
+print(compound_synonyms)
+
+# ─────────────────────────────────────────────
+# 🔍 Step 1: Filter to LABEL group and compounds of interest
+# ─────────────────────────────────────────────
+label_data <- log_data %>%
+    filter(label_group == "LABEL") %>%
+    filter(str_detect(tolower(compound), str_c(compound_synonyms, collapse = "|")))
+
+cat("\n✅ Step 1 — LABEL group + target compounds:\n")
+print(dim(label_data))
+print(unique(label_data$compound))
+
+# ─────────────────────────────────────────────
+# ❌ Step 2: Remove controls
+# ─────────────────────────────────────────────
+label_data_clean <- label_data %>%
+    select(-matches("no[_]?label|control", ignore.case = TRUE))
+
+cat("\n✅ Step 2 — Removed CONTROL / NO_LABEL columns:\n")
+print(dim(label_data_clean))
+print(colnames(label_data_clean)[1:6])
+
+# ─────────────────────────────────────────────
+# 🧮 Step 3: Convert to matrix
+# ─────────────────────────────────────────────
+label_matrix <- label_data_clean %>% column_to_rownames("compound")
+
+cat("\n✅ Step 3 — Matrix shape:\n")
+print(dim(label_matrix))
+print(rownames(label_matrix))
+print(colnames(label_matrix)[1:5])
+
+# ─────────────────────────────────────────────
+# 🔎 Step 4: Identify background columns
+# ─────────────────────────────────────────────
+media_cols <- grep("^Experiment_1_Media_", colnames(label_matrix), value = TRUE)
+cells_cols <- grep("^Experiment_1_Cells_", colnames(label_matrix), value = TRUE)
+
+cat("\n✅ Step 4 — Background column IDs:\n")
+cat("Media cols:\n"); print(media_cols)
+cat("Cells cols:\n"); print(cells_cols)
+
+# ─────────────────────────────────────────────
+# 🔁 Step 5: Reshape to long format (safe fix)
+# ─────────────────────────────────────────────
+media_long <- tibble(
+    compound = rep(rownames(label_matrix), times = length(media_cols)),
+    sample = rep(media_cols, each = nrow(label_matrix)),
+    value = as.vector(as.matrix(label_matrix[, media_cols])),
+    background = "Media"
+)
+
+cells_long <- tibble(
+    compound = rep(rownames(label_matrix), times = length(cells_cols)),
+    sample = rep(cells_cols, each = nrow(label_matrix)),
+    value = as.vector(as.matrix(label_matrix[, cells_cols])),
+    background = "Cells"
+)
+
+long_df <- bind_rows(media_long, cells_long)
+
+cat("\n✅ Step 5 — Long format:\n")
+print(dim(long_df))
+print(head(long_df))
+
+# ─────────────────────────────────────────────
+# 🧪 Step 6: Parse metadata
+# ─────────────────────────────────────────────
+long_df_parsed <- long_df %>%
+    mutate(
+        genotype = case_when(
+            str_detect(sample, "ROSA") ~ "ROSA",
+            str_detect(sample, "SLC") ~ "SLC",
+            TRUE ~ NA_character_
+        ),
+        population = case_when(
+            str_detect(sample, "_P_") ~ "P",
+            str_detect(sample, "_C_") ~ "C",
+            TRUE ~ NA_character_
+        ),
+        replicate = str_extract(sample, "rep[0-9]+"),
+        compound_clean = str_trim(str_remove(compound, "^[0-9]+\\s+"))
+    )
+
+cat("\n✅ Step 6 — Metadata parsed:\n")
+print(head(long_df_parsed))
+print(unique(long_df_parsed$compound_clean))
+
+# ─────────────────────────────────────────────
+# 🧠 Step 7: Pivot to wide format (Cells vs Media)
+# ─────────────────────────────────────────────
+long_wide <- long_df_parsed %>%
+    select(compound_clean, value, background, genotype, population, replicate) %>%
+    pivot_wider(names_from = background, values_from = value) %>%
+    filter(!is.na(Cells) & !is.na(Media))  # ✅ KEEP zeros, remove only NAs
+
+cat("\n✅ Step 7 — Final wide format for plotting (including zeros):\n")
+print(dim(long_wide))
+print(head(long_wide))
+
+# ─────────────────────────────────────────────
+# 🎯 Step 8: Filter to Linoleate only
+# ─────────────────────────────────────────────
+plot_df <- long_wide %>%
+    filter(compound_clean == "Linoleate")
+
+cat("\n🎯 Step 8 — Plotting Linoleate only:\n")
+print(dim(plot_df))
+print(unique(plot_df$replicate))
+print(unique(plot_df$genotype))
+print(unique(plot_df$population))
+
+# ─────────────────────────────────────────────
+# 🧰 Plotting function for any compound
+# ─────────────────────────────────────────────
+plot_tracer_uptake <- function(compound_name) {
+    df <- long_wide %>% filter(compound_clean == compound_name)
+    
+    if (nrow(df) == 0) {
+        warning(paste("⚠️ No data found for:", compound_name))
+        return(ggplot() + ggtitle(paste("No data:", compound_name)))
+    }
+
+    ggplot(df, aes(x = Media, y = Cells)) +
+        geom_point(aes(color = genotype, shape = population), size = 3) +
+        geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "gray50", linewidth = 0.7) +
+        coord_fixed(expand = TRUE) +
+        labs(
+            title = paste("Tracer Uptake —", compound_name),
+            x = "Media (log2 intensity)",
+            y = "Cells (log2 intensity)",
+            color = "Genotype",
+            shape = "Population"
+        ) +
+        theme_minimal(base_size = 14) +
+        theme(
+            plot.title = element_text(face = "bold"),
+            legend.position = "bottom"
+        )
+}
+
+# 🎯 Target lipids (same as in filtering step)
+target_lipids <- c("Linoleate", "Octadecenoic acid", "Hexadecanoic acid")
+
+# 🔁 Generate plots
+plots <- lapply(target_lipids, plot_tracer_uptake)
+names(plots) <- target_lipids
+
+# 🖼️ View one or all
+print(plots[["Linoleate"]])     # for a specific plot
+# print(plots[["Octadecenoic acid"]])
+# print(plots[["Hexadecanoic acid"]])
+```
+
+------------------------------------------------------------------------
+
+# Experiment 2
+
+## Z-score scatter all 16
+
+```{r}
+# ─────────────────────────────────────────────
+# 📦 Load packages (if not already loaded)
+# ─────────────────────────────────────────────
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(glue)
+
+# ─────────────────────────────────────────────
+# 🧼 Clean compound names
+# ─────────────────────────────────────────────
+clean_compound_name <- function(name) {
+  str_trim(str_remove(name, "^[0-9]+\\s+"))
+}
+
+# ─────────────────────────────────────────────
+# 🔄 Build long-format z-score dataset for Exp2
+# ─────────────────────────────────────────────
+target_lipids <- c("Hexadecanoic acid", "Octadecenoic acid", "Linoleate")
+
+rep_data_long_exp2 <- data_collapsed %>%
+  filter(label_group == "LABEL") %>%
+  select(compound, starts_with("Experiment_2")) %>%
+  mutate(compound_clean = clean_compound_name(compound)) %>%
+  filter(compound_clean %in% target_lipids) %>%
+  pivot_longer(
+    cols = starts_with("Experiment_2"),
+    names_to = "sample",
+    values_to = "value"
+  ) %>%
+  mutate(
+    value = as.numeric(value),
+    genotype = case_when(
+      str_detect(sample, "_ROSA_") ~ "ROSA",
+      str_detect(sample, "_SLC_") ~ "SLC",
+      TRUE ~ NA_character_
+    ),
+    condition = case_when(
+      str_detect(sample, "_P_") ~ "P",
+      str_detect(sample, "_C_") ~ "C",
+      TRUE ~ NA_character_
+    ),
+    treatment = case_when(
+      str_detect(sample, "_CAR_") ~ "CAR",
+      str_detect(sample, "_Mock_") ~ "Mock",
+      TRUE ~ NA_character_
+    ),
+    replicate = str_extract(sample, "rep[0-9]+")
+  ) %>%
+  filter(!is.na(genotype), !is.na(condition), !is.na(treatment), !is.na(replicate)) %>%
+  group_by(compound_clean) %>%
+  mutate(z_score = scale(value)[, 1]) %>%
+  ungroup()
+
+# ─────────────────────────────────────────────
+# 🖼️ Plotting function: CAR vs Mock by replicate
+# ─────────────────────────────────────────────
+plot_exp2_car_vs_mock <- function(df, lipid) {
+  df %>%
+    filter(compound_clean == lipid) %>%
+    pivot_wider(
+      id_cols = c(genotype, condition, replicate),
+      names_from = treatment,
+      values_from = z_score
+    ) %>%
+    filter(!is.na(CAR), !is.na(Mock)) %>%
+    ggplot(aes(x = Mock, y = CAR)) +
+    geom_point(aes(color = genotype, shape = condition), size = 4.5) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "gray50", linewidth = 0.8) +
+    coord_fixed(xlim = c(-2.5, 4.5), ylim = c(-2.5, 4.5)) +
+    scale_x_continuous(
+      limits = c(-2.5, 4.5),
+      breaks = seq(-2, 4, 1),
+      expand = expansion(mult = 0)
+    ) +
+    scale_y_continuous(
+      limits = c(-2.5, 4.5),
+      breaks = seq(-2, 4, 1),
+      expand = expansion(mult = 0)
+    ) +
+    labs(
+      title = glue("CAR vs Mock Uptake — {lipid} (Z-score)"),
+      x = "Mock (Z-score)",
+      y = "CAR (Z-score)",
+      color = "Genotype",
+      shape = "Condition"
+    ) +
+    theme_minimal(base_size = 15) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      legend.position = "bottom"
+    )
+}
+
+
+# ─────────────────────────────────────────────
+# 💾 Save plots to Experiment_2 folder
+# ─────────────────────────────────────────────
+output_dir <- "Experiment_2_plots"
+if (!dir.exists(output_dir)) dir.create(output_dir)
+
+for (lipid in target_lipids) {
+  plot_obj <- plot_exp2_car_vs_mock(rep_data_long_exp2, lipid)
+
+  file_safe_name <- gsub(" ", "_", lipid)
+  filename <- file.path(output_dir, paste0(file_safe_name, "_zScored_CARvsMock_Exp2.pdf"))
+
+  ggsave(
+    filename = filename,
+    plot = plot_obj,
+    device = "pdf",
+    width = 7,
+    height = 7,
+    dpi = 600,
+    units = "in",
+    bg = "white"
+  )
+}
+
+```
+
+```{r}
+# ─────────────────────────────────────────────
+# 📊 log2FC (CAR - Mock) in Experiment 2: Separate SLC and ROSA scatterplots
+# ─────────────────────────────────────────────
+
+library(dplyr)
+library(stringr)
+library(tibble)
+library(ggplot2)
+library(ggrepel)
+
+# 🧼 Function to clean compound names
+clean_compound_name <- function(name) {
+    str_trim(str_remove(name, "^[0-9]+\\s+"))
+}
+
+# 🔍 Prepare log2-transformed data
+log_data_exp2 <- data_collapsed %>%
+    filter(label_group == "LABEL") %>%
+    select(compound, label_group, starts_with("Experiment_2")) %>%
+    mutate(across(-c(compound, label_group), ~ log2(. + 1)))
+
+# 🧮 Safe average helper
+average_condition_exp2 <- function(df, genotype, condition_pattern) {
+    cols <- grep(condition_pattern, names(df), value = TRUE)
+    cols <- cols[str_detect(cols, genotype)]
+    if (length(cols) == 0) return(rep(NA, nrow(df)))
+    rowMeans(df[, cols, drop = FALSE], na.rm = TRUE)
+}
+
+# ─────────────────────────────────────────────
+# 💡 Genotype-specific comparisons: CAR - Mock
+# ─────────────────────────────────────────────
+
+# List of genotypes
+genotypes <- c("SLC", "ROSA")
+
+# Initialize list
+fc_combined_exp2_list <- list()
+
+for (geno in genotypes) {
+    # Define genotype-specific group labels
+    g1_C <- paste0("C_", geno, "_Mock")
+    g2_C <- paste0("C_", geno, "_CAR")
+    g1_P <- paste0("P_", geno, "_Mock")
+    g2_P <- paste0("P_", geno, "_CAR")
+    
+    # Calculate log2FC for Cells – C and P backgrounds
+    df_C <- average_condition_exp2(log_data_exp2, g2_C, "^Experiment_2_Cells_") -
+        average_condition_exp2(log_data_exp2, g1_C, "^Experiment_2_Cells_")
+    df_P <- average_condition_exp2(log_data_exp2, g2_P, "^Experiment_2_Cells_") -
+        average_condition_exp2(log_data_exp2, g1_P, "^Experiment_2_Cells_")
+    
+    # Combine into dataframe
+    fc_df <- tibble(
+        compound = log_data_exp2$compound,
+        C = df_C,
+        P = df_P
+    ) %>%
+        mutate(compound = clean_compound_name(compound))
+    
+    fc_combined_exp2_list[[geno]] <- fc_df
+}
+
+# ─────────────────────────────────────────────
+# 📈 Plot function (adapted for Experiment 2)
+# ─────────────────────────────────────────────
+
+plot_fc_comparison_exp2 <- function(df, title) {
+    max_range <- max(abs(c(df$C, df$P)), na.rm = TRUE)
+    
+    ggplot(df, aes(x = C, y = P)) +
+        geom_hline(yintercept = 0, linetype = "dashed", color = "gray70") +
+        geom_vline(xintercept = 0, linetype = "dashed", color = "gray70") +
+        geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "firebrick") +
+        geom_point(aes(color = sqrt(C^2 + P^2)), size = 3, alpha = 0.85) +
+        scale_color_gradient2(
+            low = "blue", mid = "gray85", high = "red", midpoint = 0,
+            name = "Magnitude\nlog2FC"
+        ) +
+        geom_text_repel(
+            data = df %>% filter(abs(C - P) > 2),
+            aes(label = compound),
+            size = 3.2, max.overlaps = 10, box.padding = 0.35, seed = 42
+        ) +
+        coord_fixed(xlim = c(-max_range, max_range), ylim = c(-max_range, max_range)) +
+        labs(
+            title = title,
+            x = "log2FC in C background (CAR - Mock)",
+            y = "log2FC in P background (CAR - Mock)"
+        ) +
+        theme_classic(base_size = 15) +
+        theme(
+            plot.title = element_text(face = "bold", size = 16),
+            legend.position = "right"
+        )
+}
+
+# ─────────────────────────────────────────────
+# 📊 Final Plots: One for SLC, One for ROSA
+# ─────────────────────────────────────────────
+
+plot_fc_comparison_exp2(fc_combined_exp2_list$SLC,
+                        "📈 Cells – log2FC(CAR vs Mock) for SLC: C vs P")
+
+plot_fc_comparison_exp2(fc_combined_exp2_list$ROSA,
+                        "📈 Cells – log2FC(CAR vs Mock) for ROSA: C vs P")
+
+```
+
+# Saving scatter plots
+
+```{r}
+# 📦 Load plotting libraries
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(tibble)
+library(fs)  # for directory creation
+
+# 🗂️ Create output directory if it doesn't exist
+output_dir <- "scatter_metabolipids_plots"
+dir_create(output_dir)
+
+# 🖼️ Define all plots (from previous code logic)
+media_plot <- plot_fc_comparison(media_fc_combined, "📈 Media – log2FC(ROSA vs SLC): C vs P")
+cells_plot <- plot_fc_comparison(cells_fc_combined, "📈 Cells – log2FC(ROSA vs SLC): C vs P")
+slc_plot <- plot_fc_comparison_exp2(fc_combined_exp2_list$SLC, "📈 Cells – log2FC(CAR vs Mock) for SLC: C vs P")
+rosa_plot <- plot_fc_comparison_exp2(fc_combined_exp2_list$ROSA, "📈 Cells – log2FC(CAR vs Mock) for ROSA: C vs P")
+
+# 🖨️ Save each plot as a high-res PDF (8 x 8 inches)
+ggsave(file.path(output_dir, "01_Media_ROSA_vs_SLC.pdf"), plot = media_plot, width = 8, height = 8, dpi = 300)
+ggsave(file.path(output_dir, "02_Cells_ROSA_vs_SLC.pdf"), plot = cells_plot, width = 8, height = 8, dpi = 300)
+ggsave(file.path(output_dir, "03_Cells_SLC_CAR_vs_Mock.pdf"), plot = slc_plot, width = 8, height = 8, dpi = 300)
+ggsave(file.path(output_dir, "04_Cells_ROSA_CAR_vs_Mock.pdf"), plot = rosa_plot, width = 8, height = 8, dpi = 300)
+
+```
+
+# Now we want this same plot but
+
+### C: ROSA vs SLC
+
+```{r}
+# ─────────────────────────────────────────────
+# 📦 Load libraries
+# ─────────────────────────────────────────────
+library(dplyr)
+library(stringr)
+library(tibble)
+library(ggplot2)
+library(ggrepel)
+
+# ─────────────────────────────────────────────
+# 🧼 Clean compound names
+# ─────────────────────────────────────────────
+clean_compound_name <- function(name) {
+    str_trim(str_remove(name, "^[0-9]+\\s+"))
+}
+
+# ─────────────────────────────────────────────
+# 🔁 Safe average helper (genotype & background)
+# ─────────────────────────────────────────────
+average_by_group <- function(df, group_pattern, genotype) {
+    cols <- grep(group_pattern, names(df), value = TRUE)
+    cols <- cols[str_detect(cols, genotype)]
+    if (length(cols) == 0) return(rep(NA, nrow(df)))
+    rowMeans(df[, cols, drop = FALSE], na.rm = TRUE)
+}
+
+# ─────────────────────────────────────────────
+# 🧮 Build df: C background, ROSA vs SLC (log2FC of CAR - Mock)
+# ─────────────────────────────────────────────
+
+# Step 1: log2-transform LABEL samples in Experiment_2
+log_data_exp2 <- data_collapsed %>%
+    filter(label_group == "LABEL") %>%
+    select(compound, starts_with("Experiment_2")) %>%
+    mutate(across(-compound, ~ log2(. + 1)))
+
+cat("✅ log_data_exp2 dimensions:\n")
+print(dim(log_data_exp2))  # Expect ~hundreds of compounds × samples
+
+# Step 2: Compute log2FC(CAR - Mock) for C background
+fc_C_rosavslc_xy <- tibble(
+    compound = clean_compound_name(log_data_exp2$compound),
+    SLC = average_by_group(log_data_exp2, "^Experiment_2_Cells_C_SLC_CAR", "C_SLC") -
+          average_by_group(log_data_exp2, "^Experiment_2_Cells_C_SLC_Mock", "C_SLC"),
+    ROSA = average_by_group(log_data_exp2, "^Experiment_2_Cells_C_ROSA_CAR", "C_ROSA") -
+           average_by_group(log_data_exp2, "^Experiment_2_Cells_C_ROSA_Mock", "C_ROSA")
+)
+
+cat("🎯 Final df for plotting: CAR - Mock in C background (SLC vs ROSA):\n")
+print(dim(fc_C_rosavslc_xy))
+print(head(fc_C_rosavslc_xy, 8))
+
+# ─────────────────────────────────────────────
+# 🖼️ Plot: SLC vs ROSA (C background only)
+# ─────────────────────────────────────────────
+plot_fc_C_rosavslc_xy <- ggplot(fc_C_rosavslc_xy, aes(x = SLC, y = ROSA)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray70") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray70") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "firebrick") +
+    geom_point(aes(color = sqrt(SLC^2 + ROSA^2)), size = 3, alpha = 0.85) +
+    scale_color_gradient2(
+        low = "blue", mid = "gray85", high = "red", midpoint = 0,
+        name = "Magnitude\nlog2FC"
+    ) +
+    geom_text_repel(
+        data = fc_C_rosavslc_xy %>% filter(abs(ROSA - SLC) > 2),
+        aes(label = compound),
+        size = 3.2, max.overlaps = 10, box.padding = 0.35, seed = 42
+    ) +
+    coord_fixed() +
+    labs(
+        title = "🧬 C background — log2FC(CAR vs Mock): ROSA vs SLC",
+        x = "SLC (log2FC CAR vs Mock)",
+        y = "ROSA (log2FC CAR vs Mock)"
+    ) +
+    theme_classic(base_size = 15) +
+    theme(
+        plot.title = element_text(face = "bold", size = 16),
+        legend.position = "right"
+    ) +
+    scale_x_continuous(limits = c(-20, 10), breaks = seq(-20, 10, 5)) +
+    scale_y_continuous(limits = c(-20, 10), breaks = seq(-20, 10, 5))
+
+
+
+
+```
+
+### P: ROSA vs SLC
+
+```{r}
+# ─────────────────────────────────────────────
+# 📦 Load libraries
+# ─────────────────────────────────────────────
+library(dplyr)
+library(stringr)
+library(tibble)
+library(ggplot2)
+library(ggrepel)
+
+# ─────────────────────────────────────────────
+# 🧼 Clean compound names
+# ─────────────────────────────────────────────
+clean_compound_name <- function(name) {
+    str_trim(str_remove(name, "^[0-9]+\\s+"))
+}
+
+# ─────────────────────────────────────────────
+# 🔁 Safe average helper (genotype & background)
+# ─────────────────────────────────────────────
+average_by_group <- function(df, group_pattern, genotype) {
+    cols <- grep(group_pattern, names(df), value = TRUE)
+    cols <- cols[str_detect(cols, genotype)]
+    if (length(cols) == 0) return(rep(NA, nrow(df)))
+    rowMeans(df[, cols, drop = FALSE], na.rm = TRUE)
+}
+
+# ─────────────────────────────────────────────
+# 🧮 Build df: P background, ROSA vs SLC (log2FC of CAR - Mock)
+# ─────────────────────────────────────────────
+
+# Step 1: log2-transform LABEL samples in Experiment_2
+log_data_exp2 <- data_collapsed %>%
+    filter(label_group == "LABEL") %>%
+    select(compound, starts_with("Experiment_2")) %>%
+    mutate(across(-compound, ~ log2(. + 1)))
+
+cat("✅ log_data_exp2 dimensions:\n")
+print(dim(log_data_exp2))  # Expect ~hundreds of compounds × samples
+
+# Step 2: Compute log2FC(CAR - Mock) for P background
+fc_P_rosavslc_xy <- tibble(
+    compound = clean_compound_name(log_data_exp2$compound),
+    SLC = average_by_group(log_data_exp2, "^Experiment_2_Cells_P_SLC_CAR", "P_SLC") -
+          average_by_group(log_data_exp2, "^Experiment_2_Cells_P_SLC_Mock", "P_SLC"),
+    ROSA = average_by_group(log_data_exp2, "^Experiment_2_Cells_P_ROSA_CAR", "P_ROSA") -
+           average_by_group(log_data_exp2, "^Experiment_2_Cells_P_ROSA_Mock", "P_ROSA")
+)
+
+cat("🎯 Final df for plotting: CAR - Mock in P background (SLC vs ROSA):\n")
+print(dim(fc_P_rosavslc_xy))
+print(head(fc_P_rosavslc_xy, 8))
+
+# ─────────────────────────────────────────────
+# 🖼️ Plot: SLC vs ROSA (P background only)
+# ─────────────────────────────────────────────
+plot_fc_P_rosavslc_xy <- ggplot(fc_P_rosavslc_xy, aes(x = SLC, y = ROSA)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray70") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray70") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "firebrick") +
+    geom_point(aes(color = sqrt(SLC^2 + ROSA^2)), size = 3, alpha = 0.85) +
+    scale_color_gradient2(
+        low = "blue", mid = "gray85", high = "red", midpoint = 0,
+        name = "Magnitude\nlog2FC"
+    ) +
+    geom_text_repel(
+        data = fc_P_rosavslc_xy %>% filter(abs(ROSA - SLC) > 2),
+        aes(label = compound),
+        size = 3.2, max.overlaps = 10, box.padding = 0.35, seed = 42
+    ) +
+    coord_fixed() +
+    labs(
+        title = "🧬 P background — log2FC(CAR vs Mock): ROSA vs SLC",
+        x = "SLC (log2FC CAR vs Mock)",
+        y = "ROSA (log2FC CAR vs Mock)"
+    ) +
+    theme_classic(base_size = 15) +
+    theme(
+        plot.title = element_text(face = "bold", size = 16),
+        legend.position = "right"
+    ) +
+    scale_x_continuous(limits = c(-21, 10), breaks = seq(-20, 10, 5)) +
+    scale_y_continuous(limits = c(-21, 10), breaks = seq(-20, 10, 5))
+
+```
+
+# Resistant vs Sensitive
+
+# for each we have the logFC of CAR vs MOCK (CAR as numerator)
+
+```{r}
+# ─────────────────────────────────────────────
+# 📦 Load libraries
+# ─────────────────────────────────────────────
+library(dplyr)
+library(stringr)
+library(tibble)
+
+# ─────────────────────────────────────────────
+# 🧼 Clean compound names
+# ─────────────────────────────────────────────
+clean_compound_name <- function(name) {
+    str_trim(str_remove(name, "^[0-9]+\\s+"))
+}
+
+# ─────────────────────────────────────────────
+# 🔁 Helper: average by group (CAR or Mock) in sensitive/resistant sets
+# ─────────────────────────────────────────────
+average_by_group <- function(df, pattern) {
+    cols <- grep(pattern, names(df), value = TRUE)
+    if (length(cols) == 0) return(rep(NA, nrow(df)))
+    rowMeans(df[, cols, drop = FALSE], na.rm = TRUE)
+}
+
+# ─────────────────────────────────────────────
+# 🧮 Build log2FC(CAR - Mock) per group
+# ─────────────────────────────────────────────
+
+# Step 1: log2-transform only LABEL samples
+log_data_exp2 <- data_collapsed %>%
+    filter(label_group == "LABEL") %>%
+    select(compound, starts_with("Experiment_2")) %>%
+    mutate(across(-compound, ~ log2(. + 1)))
+
+cat("✅ log_data_exp2 dimensions:\n")
+print(dim(log_data_exp2))
+
+# Step 2: Compute log2FC(CAR - Mock) for each of the 4 relevant conditions
+log2fc_df <- tibble(
+    compound = clean_compound_name(log_data_exp2$compound),
+    
+    # Sensitive samples
+    C_ROSA = average_by_group(log_data_exp2, "^Experiment_2_Cells_C_ROSA_CAR") -
+             average_by_group(log_data_exp2, "^Experiment_2_Cells_C_ROSA_Mock"),
+    
+    C_SLC  = average_by_group(log_data_exp2, "^Experiment_2_Cells_C_SLC_CAR") -
+             average_by_group(log_data_exp2, "^Experiment_2_Cells_C_SLC_Mock"),
+    
+    P_SLC  = average_by_group(log_data_exp2, "^Experiment_2_Cells_P_SLC_CAR") -
+             average_by_group(log_data_exp2, "^Experiment_2_Cells_P_SLC_Mock"),
+    
+    # Resistant sample
+    P_ROSA = average_by_group(log_data_exp2, "^Experiment_2_Cells_P_ROSA_CAR") -
+             average_by_group(log_data_exp2, "^Experiment_2_Cells_P_ROSA_Mock")
+)
+
+cat("✅ Raw log2FC table (CAR - Mock):\n")
+print(head(log2fc_df, 8))
+
+# Step 3: Compute mean sensitive log2FC and build final df
+fc_resistant_vs_sensitive <- log2fc_df %>%
+    mutate(
+        Sensitive = rowMeans(select(., C_ROSA, C_SLC, P_SLC), na.rm = TRUE),
+        Resistant = P_ROSA
+    ) %>%
+    select(compound, Sensitive, Resistant)
+
+# Step 4: Inspect ranges before plotting
+cat("🎯 Final table for Resistant vs Sensitive plotting:\n")
+print(summary(fc_resistant_vs_sensitive))
+print(head(fc_resistant_vs_sensitive, 10))
+
+
+plot_fc_resistant_vs_sensitive <- ggplot(fc_resistant_vs_sensitive, aes(x = Sensitive, y = Resistant)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray70") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray70") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "firebrick") +
+    geom_point(aes(color = sqrt(Sensitive^2 + Resistant^2)), size = 3, alpha = 0.85) +
+    scale_color_gradient2(
+        low = "blue", mid = "gray85", high = "red", midpoint = 0,
+        name = "Magnitude\nlog2FC"
+    ) +
+    geom_text_repel(
+        data = fc_resistant_vs_sensitive %>% filter(abs(Sensitive - Resistant) > 2),
+        aes(label = compound),
+        size = 3.2, max.overlaps = 10, box.padding = 0.35, seed = 42
+    ) +
+    scale_x_continuous(
+        limits = c(min(fc_resistant_vs_sensitive$Sensitive) - 1, max(fc_resistant_vs_sensitive$Sensitive) + 1),
+        breaks = pretty(c(min(fc_resistant_vs_sensitive$Sensitive), max(fc_resistant_vs_sensitive$Sensitive)), n = 6)
+    ) +
+    scale_y_continuous(
+        limits = c(min(fc_resistant_vs_sensitive$Resistant) - 1, max(fc_resistant_vs_sensitive$Resistant) + 1),
+        breaks = pretty(c(min(fc_resistant_vs_sensitive$Resistant), max(fc_resistant_vs_sensitive$Resistant)), n = 6)
+    ) +
+    coord_fixed() +
+    labs(
+        title = "🧬 Resistant vs Sensitive — log2FC(CAR vs Mock)",
+        x = "Mean Sensitive (log2FC CAR vs Mock)",
+        y = "Resistant (log2FC CAR vs Mock)"
+    ) +
+    theme_classic(base_size = 15) +
+    theme(
+        plot.title = element_text(face = "bold", size = 16),
+        legend.position = "right"
+    )
+
+```
+
+```{r}
+# ─────────────────────────────────────────────
+# 💾 Save all Experiment 2 CAR vs Mock summary plots
+# ─────────────────────────────────────────────
+
+output_dir <- "Experiment_2_plots"
+if (!dir.exists(output_dir)) dir.create(output_dir)
+
+# Named list of plots
+summary_plots <- list(
+  "C_ROSA_vs_SLC_log2FC_CARvsMock" = plot_fc_C_rosavslc_xy,
+  "P_ROSA_vs_SLC_log2FC_CARvsMock" = plot_fc_P_rosavslc_xy,
+  "Resistant_vs_Sensitive_log2FC_CARvsMock" = plot_fc_resistant_vs_sensitive
+)
+
+# Save each plot as high-res PDF
+for (plot_name in names(summary_plots)) {
+  ggsave(
+    filename = file.path(output_dir, paste0(plot_name, ".pdf")),
+    plot = summary_plots[[plot_name]],
+    device = "pdf",
+    width = 7,
+    height = 7,
+    dpi = 600,
+    units = "in",
+    bg = "white"
+  )
+}
+
+```

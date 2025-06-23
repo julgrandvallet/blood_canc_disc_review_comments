@@ -1,0 +1,423 @@
+```{r}
+# ===============================================
+# 📦 Load packages
+# ===============================================
+library(readxl)
+library(dplyr)
+library(stringr)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# ===============================================
+# 📄 1. Load gene list from Excel
+# ===============================================
+list_to_analyze <- readxl::read_xlsx("060225 Gene Lists.xlsx")
+all_genes <- unique(unlist(list_to_analyze))
+all_genes <- na.omit(all_genes)
+bg_genes <- read_xlsx("083023_CRISPRScreenTotalSummary_logFC copy.xlsx")
+
+# ===============================================
+# 🧬 2. Parse GTF and extract gene_name entries
+# ===============================================
+gtf_path <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Isaac/multiomics/rnaseq/Homo_sapiens.GRCh38.113.gtf.gz"
+gtf_lines <- readLines(gtf_path)
+gtf_genes <- grep("gene_name", gtf_lines, value = TRUE)
+
+extract_gene_name <- function(line) {
+    match <- regmatches(line, regexpr("gene_name \"[^\"]+\"", line))
+    sub("gene_name \"([^\"]+)\"", "\\1", match)
+}
+gtf_gene_names <- unique(sapply(gtf_genes, extract_gene_name))
+
+# ===============================================
+# 🔍 3. Compare list entries with GTF genes
+# ===============================================
+missing_genes <- setdiff(all_genes, gtf_gene_names)
+
+cat("✅ Genes in Excel:", length(all_genes), "\n")
+cat("✅ Genes found in GTF:", length(intersect(all_genes, gtf_gene_names)), "\n")
+cat("❌ Genes NOT found in GTF:", length(missing_genes), "\n")
+
+# ===============================================
+# 🛠️ 4. Attempt to rescue unmapped entries
+# ===============================================
+# Separate numeric and non-numeric
+numeric_ids <- missing_genes[grepl("^[0-9]+$", missing_genes)]
+symbol_ids  <- setdiff(missing_genes, numeric_ids)
+
+# Try mapping numeric IDs as ENTREZID → SYMBOL
+entrez_mapped <- tryCatch({
+    bitr(numeric_ids, fromType = "ENTREZID", toType = "SYMBOL", OrgDb = org.Hs.eg.db)
+}, error = function(e) data.frame())
+
+# Try mapping symbol IDs as SYMBOL → ENSEMBL
+symbol_mapped <- tryCatch({
+    bitr(symbol_ids, fromType = "SYMBOL", toType = "ENSEMBL", OrgDb = org.Hs.eg.db)
+}, error = function(e) data.frame())
+
+# Try mapping ALIAS → SYMBOL
+alias_mapped <- tryCatch({
+    bitr(symbol_ids, fromType = "ALIAS", toType = "SYMBOL", OrgDb = org.Hs.eg.db)
+}, error = function(e) data.frame())
+
+# Step: Track which inputs were successfully mapped
+mapped_inputs <- unique(c(
+    as.character(entrez_mapped$ENTREZID),
+    as.character(symbol_mapped$SYMBOL),
+    as.character(alias_mapped$ALIAS)
+))
+still_missing <- setdiff(missing_genes, mapped_inputs)
+
+# 🔄 Rescue numeric-only still missing
+numeric_rescue <- still_missing[grepl("^[0-9]+$", still_missing)]
+rescued_from_entrez <- tryCatch({
+    bitr(numeric_rescue, fromType = "ENTREZID", toType = "SYMBOL", OrgDb = org.Hs.eg.db)
+}, error = function(e) data.frame())
+rescued_symbols_entrez <- unique(rescued_from_entrez$SYMBOL)
+
+# ✅ Final set of rescued gene SYMBOLs
+final_rescued_symbols <- unique(c(
+    entrez_mapped$SYMBOL,
+    alias_mapped$SYMBOL,
+    rescued_symbols_entrez
+))
+
+
+cat("🔍 Total originally missing from GTF:", length(missing_genes), "\n")
+cat("✅ Rescued gene symbols:", length(final_rescued_symbols), "\n")
+cat("❌ Still unmapped:", length(setdiff(missing_genes, mapped_inputs)), "\n")
+```
+
+```{r}
+# Merge with standard org.Hs.eg.db symbols
+# valid_symbols <- unique(c(keys(org.Hs.eg.db, keytype = "SYMBOL"), final_rescued_symbols))
+# 
+# # ===============================
+# # 🧬 Background for enrichment (SYMBOLs)
+# # ===============================
+# bg_ids <- unique(bg_genes$Gene)
+# bg_ids <- bg_ids[!is.na(bg_ids) & !(grepl("^[0-9]+$", bg_ids))]  # remove numeric entries
+# background_symbols <- intersect(bg_ids, valid_symbols)
+# 
+# # ===============================
+# # 🧬 Setup storage
+# # ===============================
+# enrichment_results <- list()  # to store gprofiler results
+# 
+# # ===============================
+# # 🔁 Loop over each gene list column
+# # ===============================
+# for (colname in colnames(list_to_analyze)) {
+#     # 1. Extract and clean gene list
+#     gene_list <- na.omit(unique(list_to_analyze[[colname]]))
+#     gene_list <- gene_list[gene_list %in% valid_symbols]  # includes rescued symbols
+# 
+#     if (length(gene_list) < 3) {
+#         message("⚠️ Skipping ", colname, ": too few valid genes.")
+#         next
+#     }
+# 
+#     cat("\n📂 Analyzing gene set:", colname, "|", length(gene_list), "genes\n")
+# 
+#     # 2. Run g:Profiler2 enrichment
+#     gprof_res <- gost(
+#         query = gene_list,
+#         organism = "hsapiens",
+#         ordered_query = FALSE,
+#         multi_query = FALSE,
+#         significant = TRUE,
+#         user_threshold = 0.05,
+#         correction_method = "g_SCS",
+#         domain_scope = "custom",
+#         custom_bg = background_symbols,
+#         evcodes = TRUE,
+#         sources = c("GO", "KEGG", "REAC", "TF", "MIRNA", "CORUM", "HP", "HPA", "WP")
+#     )
+# 
+#     # 3. Save enrichment results safely
+#     if (!is.null(gprof_res)) {
+#         enrichment_df <- gprof_res$result
+# 
+#         # Flatten any list-columns to strings
+#         enrichment_df <- enrichment_df %>%
+#             dplyr::mutate(across(where(is.list), ~ sapply(., paste, collapse = ";")))
+# 
+#         enrichment_results[[colname]] <- enrichment_df
+# 
+#         out_path <- paste0("enrichment_", gsub(" ", "_", colname), ".csv")
+#         write.csv(enrichment_df, out_path, row.names = FALSE)
+#         cat("✅ Enrichment saved to:", out_path, "\n")
+#     } else {
+#         cat("❌ No enrichment found for:", colname, "\n")
+#     }
+# }
+
+```
+
+# Doing HALLMARKS
+```{r}
+# ===============================================
+# 🧬 Hallmark Pathway Enrichment with clusterProfiler
+# ===============================================
+
+# 1. Load required packages
+library(clusterProfiler)
+library(msigdbr)
+library(dplyr)
+
+# 2. Load Hallmark gene sets (MSigDB collection H for humans)
+hallmark_sets <- msigdbr(species = "Homo sapiens", category = "H") %>%
+    dplyr::select(gs_name, gene_symbol) %>%
+    as.data.frame()
+
+# 3. Convert to a list format for enricher
+hallmark_list <- split(hallmark_sets$gene_symbol, hallmark_sets$gs_name)
+
+# 4. Initialize result list
+hallmark_results <- list()
+
+# 5. Loop over your gene sets
+for (colname in colnames(list_to_analyze)) {
+    # Extract and filter gene list
+    gene_list <- na.omit(unique(list_to_analyze[[colname]]))
+    gene_list <- gene_list[gene_list %in% valid_symbols]
+    
+    if (length(gene_list) < 5) {
+        message("⚠️ Skipping ", colname, ": too few valid genes.")
+        next
+    }
+    
+    cat("\n📂 Enriching Hallmarks for:", colname, "\n")
+    
+    # Run enrichment against Hallmark sets
+    enrich_res <- enricher(gene = gene_list, TERM2GENE = hallmark_sets)
+    
+    # Store and optionally save results
+    if (!is.null(enrich_res)) {
+        hallmark_results[[colname]] <- enrich_res
+        out_path <- paste0("hallmark_enrichment_", gsub(" ", "_", colname), ".csv")
+        #write.csv(as.data.frame(enrich_res), out_path, row.names = FALSE)
+        cat("✅ Hallmark enrichment saved to:", out_path, "\n")
+    } else {
+        cat("❌ No significant hallmark terms found for:", colname, "\n")
+    }
+}
+```
+
+
+
+# Doing Stringdb
+
+
+```{r}
+library(igraph)
+
+# Create output folder if it doesn't exist
+if (!dir.exists("stringdb_networks")) {
+    dir.create("stringdb_networks")
+}
+
+# Initialize STRINGdb (v11.5, human, score ≥ 950)
+string_db <- STRINGdb$new(version = "11.5", species = 9606, score_threshold = 950)
+
+string_connected_ids <- list()
+
+for (colname in colnames(list_to_analyze)) {
+    cat("\n🔍 STRING PPI for:", colname, "\n")
+    
+    gene_list <- na.omit(unique(list_to_analyze[[colname]]))
+    gene_df <- data.frame(SYMBOL = gene_list)
+    
+    mapped <- string_db$map(gene_df, "SYMBOL", removeUnmappedRows = TRUE)
+    if (nrow(mapped) == 0) {
+        cat("❌ No genes mapped to STRING for", colname, "\n")
+        next
+    }
+    
+    interactions <- string_db$get_interactions(mapped$STRING_id)
+    if (nrow(interactions) == 0) {
+        cat("❌ No interactions found among mapped genes for", colname, "\n")
+        next
+    }
+    
+    g <- graph_from_data_frame(interactions, directed = FALSE)
+    comps <- components(g)
+    comp_sizes <- table(comps$membership)
+    total_connected <- length(unique(c(interactions$from, interactions$to)))
+    
+    if (total_connected > 15) {
+        largest_comp <- names(which.max(comp_sizes))
+        keep_ids <- V(g)$name[comps$membership == largest_comp]
+        filtered_mapped <- mapped[mapped$STRING_id %in% keep_ids, ]
+        cat("🧠 Keeping only largest component (", length(keep_ids), " proteins)\n")
+    } else {
+        keep_ids <- unique(c(interactions$from, interactions$to))
+        filtered_mapped <- mapped[mapped$STRING_id %in% keep_ids, ]
+        cat("🔎 Network small — plotting all connected proteins\n")
+    }
+    
+    if (nrow(filtered_mapped) == 0) {
+        cat("⚠️ No suitable nodes to plot for:", colname, "\n")
+        next
+    }
+    
+    cat("✅ Plotting", nrow(filtered_mapped), "proteins for:", colname, "\n")
+    
+    # Save plot to high-res PDF
+    pdf_path <- paste0("stringdb_networks/", gsub(" ", "_", colname), ".pdf")
+    pdf(file = pdf_path, width = 10, height = 10, useDingb = FALSE)
+    string_db$plot_network(filtered_mapped$STRING_id)
+    dev.off()
+    
+    string_connected_ids[[colname]] <- filtered_mapped
+    cat("💾 Saved network to:", pdf_path, "\n")
+}
+```
+## stringdb enrichment
+
+```{r}
+# Store enrichment results
+string_enrichment_results <- list()
+
+for (name in names(string_connected_ids)) {
+    cat("\n🔎 Checking pathway enrichment for:", name, "\n")
+    
+    # Extract STRING IDs from connected proteins
+    string_ids <- string_connected_ids[[name]]$STRING_id
+    
+    # Run STRING enrichment analysis
+    enrichment <- string_db$get_enrichment(string_ids)
+    
+    # Filter for significant hits (optional: FDR < 0.05)
+    enrichment_filtered <- enrichment[enrichment$fdr < 0.05, ]
+    
+    if (nrow(enrichment_filtered) > 0) {
+        cat("✅ Found", nrow(enrichment_filtered), "significant enriched terms\n")
+    } else {
+        cat("❌ No significant enriched terms found\n")
+    }
+    
+    # Store the enrichment results
+    string_enrichment_results[[name]] <- enrichment_filtered
+}
+
+# Ensure output folder exists
+if (!dir.exists("stringdb_networks")) {
+    dir.create("stringdb_networks")
+}
+
+# Save each enrichment result to a separate CSV in the folder
+for (name in names(string_enrichment_results)) {
+    df <- string_enrichment_results[[name]]
+    if (nrow(df) > 0) {
+        fname <- file.path("stringdb_networks", paste0("stringdb_enrichment_", gsub(" ", "_", name), ".csv"))
+        write.csv(df, fname, row.names = FALSE)
+    }
+}
+
+```
+
+### Are there any enriched pathways that are shared by 697 MUT only and SEM MUT Only, but not present in 697 WT Only?
+
+#### Do an upset plot
+
+```{r}
+# Extract the enrichment data for the selected sets
+mut_df <- string_enrichment_results[["697 MUT only"]]
+sem_df <- string_enrichment_results[["SEM MUT Only"]]
+wt_df  <- string_enrichment_results[["697 WT Only"]]
+
+# Get unique pathway identifiers (e.g. GO terms or KEGG ids)
+mut_terms <- unique(mut_df$term)
+sem_terms <- unique(sem_df$term)
+wt_terms  <- unique(wt_df$term)
+
+# Identify overlapping terms between MUT and SEM, but not WT
+overlap_mut_sem <- intersect(mut_terms, sem_terms)
+exclusive_overlap <- setdiff(overlap_mut_sem, wt_terms)
+
+# Get full data (optional) for review
+exclusive_paths_df <- rbind(
+    mut_df[mut_df$term %in% exclusive_overlap, ],
+    sem_df[sem_df$term %in% exclusive_overlap, ]
+)
+
+# View result
+print(exclusive_paths_df)
+
+# Save the exclusive overlapping enrichment results to a CSV file
+write.csv(exclusive_paths_df, file = "stringdb_networks/exclusive_enrichment_overlap_697MUT_SEMMUT_notWT.csv", row.names = FALSE)
+
+```
+
+
+
+```{r}
+# ===============================
+# 📊 CRISPR Score Scatterplots
+# ===============================
+
+# Load libraries (make sure ggplot2 is included)
+library(tidyverse)
+library(ggrepel)
+
+bg_genes <- read_xlsx("083023_CRISPRScreenTotalSummary_logFC copy.xlsx")
+
+# Step 1: Average duplicate entries
+avg_scores <- bg_genes %>%
+  group_by(Gene) %>%
+  summarise(across(everything(), mean, na.rm = TRUE)) %>%
+  ungroup()
+
+# Step 2: Gene list to highlight (your CRISPR hits)
+highlight_genes <- c(
+  "PSD2", "AURKAIP1", "SLC27A2", "SDF2L1", "PLTP",
+  "CBL", "DDN", "EIF3L", "FUNDC2", "CD19"
+)
+
+# Step 3: Plotting function
+plot_crispr_scatter <- function(df, x_col, y_col, highlight_genes, title = "") {
+  df <- df %>%
+    mutate(
+      highlight = Gene %in% highlight_genes,
+      label = ifelse(highlight, Gene, NA)
+    )
+
+  ggplot(df, aes(x = .data[[x_col]], y = .data[[y_col]])) +
+    # 1. Background points first (non-highlighted)
+    geom_point(data = subset(df, !highlight), color = "grey", alpha = 0.5) +
+    # 2. Highlighted points second (on top)
+    geom_point(data = subset(df, highlight), color = "orange", size = 2.5) +
+    # 3. Add zero lines
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+    # 4. Add labels for highlighted genes
+    ggrepel::geom_text_repel(data = subset(df, highlight),
+                             aes(label = label),
+                             color = "black", size = 3.2,
+                             max.overlaps = Inf) +
+    labs(title = title, x = x_col, y = y_col) +
+    theme_minimal()
+}
+
+
+# Step 4: Create each plot
+p1 <- plot_crispr_scatter(avg_scores, "697-C logFC", "697-P logFC", highlight_genes, title = "697-C vs 697-P")
+p2 <- plot_crispr_scatter(avg_scores, "NALM6_C_logFC", "NALM6_P4_logFC", highlight_genes, title = "NALM6-C vs NALM6-P")
+p3 <- plot_crispr_scatter(avg_scores, "697-P logFC", "SEM-C logFC", highlight_genes, title = "697-P vs SEM-P")
+
+# Step 5: Print the plots
+p1
+p2
+p3
+
+# ===============================
+# 💾 Save plots as high-resolution PDFs
+# ===============================
+
+ggsave("plot_697C_vs_697P.pdf", plot = p1, device = "pdf", width = 6, height = 6, units = "in", dpi = 600)
+ggsave("plot_NALM6C_vs_NALM6P.pdf", plot = p2, device = "pdf", width = 6, height = 6, units = "in", dpi = 600)
+ggsave("plot_697P_vs_SEMC.pdf", plot = p3, device = "pdf", width = 6, height = 6, units = "in", dpi = 600)
+
+```
+
