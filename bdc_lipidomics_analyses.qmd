@@ -7,6 +7,7 @@ library(stringr)
 library(purrr)
 library(tibble)
 library(pheatmap)
+library(readr)
 ```
 
 ```{r}
@@ -572,11 +573,14 @@ plot_lipid_zscore <- function(df, compound_name) {
     cat(glue::glue("\n🎯 Plotting {compound_name} (z-score):\n"))
     print(dim(lipid_df))
 
+    # Compute symmetric max range
+    max_val <- max(abs(c(lipid_df$Media, lipid_df$Cells)), na.rm = TRUE) * 1.1
+
     ggplot(lipid_df, aes(x = Media, y = Cells)) +
         geom_point(aes(color = genotype, shape = population), size = 4.5) +
         geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "gray50", linewidth = 0.8) +
-        scale_x_continuous(expand = expansion(mult = 0.05)) +
-        scale_y_continuous(expand = expansion(mult = 0.05)) +
+        scale_x_continuous(limits = c(-max_val, max_val), expand = expansion(mult = 0)) +
+        scale_y_continuous(limits = c(-max_val, max_val), expand = expansion(mult = 0)) +
         coord_fixed() +
         labs(
             title = glue::glue("Tracer Uptake — {compound_name} (Z-score)"),
@@ -630,6 +634,140 @@ for (lipid in lipids) {
 
 
 ```
+### Matt asked for Genotype Specific zscored_avg_data_wide for Genotype-Averaged Z-scores
+
+
+```{r}
+# ─────────────────────────────────────────────
+# 📊 Z-scored LABEL Data (Genotype-Averaged)
+# ─────────────────────────────────────────────
+zscored_avg_data_wide <- data_collapsed %>%
+  filter(label_group == "LABEL") %>%
+  select(compound, starts_with("Experiment_1")) %>%
+  mutate(compound_clean = clean_compound_name(compound)) %>%
+  filter(compound_clean %in% target_lipids) %>%
+  pivot_longer(
+    cols = starts_with("Experiment_1"),
+    names_to = "sample",
+    values_to = "value"
+  ) %>%
+  mutate(
+    genotype = case_when(
+      str_detect(sample, "_ROSA_") ~ "ROSA",
+      str_detect(sample, "_SLC_") ~ "SLC",
+      TRUE ~ NA_character_
+    ),
+    background = case_when(
+      str_detect(sample, "_Cells_") ~ "Cells",
+      str_detect(sample, "_Media_") ~ "Media",
+      TRUE ~ NA_character_
+    ),
+    population = case_when(
+      str_detect(sample, "_P_") ~ "P",
+      str_detect(sample, "_C_") ~ "C",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(genotype), !is.na(background)) %>%
+  group_by(compound_clean, background) %>%
+  mutate(z_score = scale(value)[, 1]) %>%
+  ungroup() %>%
+  group_by(compound_clean, genotype, population, background) %>%
+  summarise(z_score = mean(z_score, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = background, values_from = z_score) %>%
+  filter(!is.na(Cells), !is.na(Media))
+
+# Inspect
+cat("✅ Z-scored averaged genotype-level data:\n")
+print(zscored_avg_data_wide)
+
+# ─────────────────────────────────────────────
+# 📈 New plot function (no coord_fixed)
+# ─────────────────────────────────────────────
+plot_lipid_zscore_avg <- function(df, compound_name) {
+  lipid_df <- df %>% filter(compound_clean == compound_name)
+  
+  # Compute max range across both axes, with buffer
+  max_val <- max(abs(c(lipid_df$Cells, lipid_df$Media)), na.rm = TRUE) * 1.1
+
+  cat(glue::glue("\n🎯 Plotting {compound_name} (avg z-score):\n"))
+  print(dim(lipid_df))
+
+  ggplot(lipid_df, aes(x = Media, y = Cells)) +
+    geom_point(aes(color = genotype, shape = population), size = 4.5) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "gray50", linewidth = 0.8) +
+    scale_x_continuous(
+      limits = c(-max_val, max_val),
+      expand = expansion(mult = 0)
+    ) +
+    scale_y_continuous(
+      limits = c(-max_val, max_val),
+      expand = expansion(mult = 0)
+    ) +
+    coord_fixed() +
+    labs(
+      title = glue::glue("Avg Tracer Uptake — {compound_name} (Z-score)"),
+      x = "Media (Z-score)",
+      y = "Cells (Z-score)",
+      color = "Genotype",
+      shape = "Population"
+    ) +
+    theme_minimal(base_size = 15) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      legend.position = "bottom"
+    )
+}
+
+
+
+# Crear los tres gráficos
+plot1 <- plot_lipid_zscore_avg(zscored_avg_data_wide, "Hexadecanoic acid")
+plot2 <- plot_lipid_zscore_avg(zscored_avg_data_wide, "Octadecenoic acid")
+plot3 <- plot_lipid_zscore_avg(zscored_avg_data_wide, "Linoleate")
+
+# Mostrar los gráficos uno por uno
+print(plot1)
+print(plot2)
+print(plot3)
+
+
+# ─────────────────────────────────────────────
+# 💾 Save plots to specified directory
+# ─────────────────────────────────────────────
+output_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/blood_canc_disc_reviewer_comments/experiment_1_plots"
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+# 💾 Guardar y mostrar gráficos
+for (lipid in target_lipids) {
+    plot_obj <- plot_lipid_zscore_avg(zscored_avg_data_wide, lipid)
+
+    # Mostrar el gráfico en pantalla
+    print(plot_obj)
+
+    # Guardar el gráfico como PDF
+    file_safe_name <- gsub(" ", "_", lipid)
+    filename <- paste0(output_dir, "/", file_safe_name, "_zScored_avg.pdf")
+
+    ggsave(
+        filename = filename,
+        plot = plot_obj,
+        device = "pdf",
+        width = 7,
+        height = 7,
+        dpi = 600,
+        units = "in",
+        bg = "white"
+    )
+}
+
+
+
+
+```
+
+
+
 
 ## 🧪 Scatter Plot of Raw log2 Intensities for Tracer Uptake (Replicate-Level, Experiment 1)
 
@@ -866,28 +1004,30 @@ rep_data_long_exp2 <- data_collapsed %>%
 # 🖼️ Plotting function: CAR vs Mock by replicate
 # ─────────────────────────────────────────────
 plot_exp2_car_vs_mock <- function(df, lipid) {
-  df %>%
+  lipid_df <- df %>%
     filter(compound_clean == lipid) %>%
     pivot_wider(
       id_cols = c(genotype, condition, replicate),
       names_from = treatment,
       values_from = z_score
     ) %>%
-    filter(!is.na(CAR), !is.na(Mock)) %>%
-    ggplot(aes(x = Mock, y = CAR)) +
+    filter(!is.na(CAR), !is.na(Mock))
+
+  # 🔎 Determine symmetric axis range with 10% buffer
+  max_val <- max(abs(c(lipid_df$CAR, lipid_df$Mock)), na.rm = TRUE) * 1.1
+
+  ggplot(lipid_df, aes(x = Mock, y = CAR)) +
     geom_point(aes(color = genotype, shape = condition), size = 4.5) +
     geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "gray50", linewidth = 0.8) +
-    coord_fixed(xlim = c(-2.5, 4.5), ylim = c(-2.5, 4.5)) +
     scale_x_continuous(
-      limits = c(-2.5, 4.5),
-      breaks = seq(-2, 4, 1),
+      limits = c(-max_val, max_val),
       expand = expansion(mult = 0)
     ) +
     scale_y_continuous(
-      limits = c(-2.5, 4.5),
-      breaks = seq(-2, 4, 1),
+      limits = c(-max_val, max_val),
       expand = expansion(mult = 0)
     ) +
+    coord_fixed() +
     labs(
       title = glue("CAR vs Mock Uptake — {lipid} (Z-score)"),
       x = "Mock (Z-score)",
@@ -901,6 +1041,7 @@ plot_exp2_car_vs_mock <- function(df, lipid) {
       legend.position = "bottom"
     )
 }
+
 
 
 # ─────────────────────────────────────────────
@@ -1127,6 +1268,9 @@ print(head(fc_C_rosavslc_xy, 8))
 # ─────────────────────────────────────────────
 # 🖼️ Plot: SLC vs ROSA (C background only)
 # ─────────────────────────────────────────────
+max_val_c <- max(abs(c(fc_C_rosavslc_xy$SLC, fc_C_rosavslc_xy$ROSA)), na.rm = TRUE) * 1.1
+
+
 plot_fc_C_rosavslc_xy <- ggplot(fc_C_rosavslc_xy, aes(x = SLC, y = ROSA)) +
     geom_hline(yintercept = 0, linetype = "dashed", color = "gray70") +
     geom_vline(xintercept = 0, linetype = "dashed", color = "gray70") +
@@ -1141,7 +1285,7 @@ plot_fc_C_rosavslc_xy <- ggplot(fc_C_rosavslc_xy, aes(x = SLC, y = ROSA)) +
         aes(label = compound),
         size = 3.2, max.overlaps = 10, box.padding = 0.35, seed = 42
     ) +
-    coord_fixed() +
+    coord_fixed(xlim = c(-max_val_c, max_val_c), ylim = c(-max_val_c, max_val_c)) +
     labs(
         title = "🧬 C background — log2FC(CAR vs Mock): ROSA vs SLC",
         x = "SLC (log2FC CAR vs Mock)",
@@ -1151,9 +1295,8 @@ plot_fc_C_rosavslc_xy <- ggplot(fc_C_rosavslc_xy, aes(x = SLC, y = ROSA)) +
     theme(
         plot.title = element_text(face = "bold", size = 16),
         legend.position = "right"
-    ) +
-    scale_x_continuous(limits = c(-20, 10), breaks = seq(-20, 10, 5)) +
-    scale_y_continuous(limits = c(-20, 10), breaks = seq(-20, 10, 5))
+    )
+
 
 
 
@@ -1218,6 +1361,9 @@ print(head(fc_P_rosavslc_xy, 8))
 # ─────────────────────────────────────────────
 # 🖼️ Plot: SLC vs ROSA (P background only)
 # ─────────────────────────────────────────────
+# Dynamically compute max range for axis limits
+max_val_p <- max(abs(c(fc_P_rosavslc_xy$SLC, fc_P_rosavslc_xy$ROSA)), na.rm = TRUE) * 1.1
+
 plot_fc_P_rosavslc_xy <- ggplot(fc_P_rosavslc_xy, aes(x = SLC, y = ROSA)) +
     geom_hline(yintercept = 0, linetype = "dashed", color = "gray70") +
     geom_vline(xintercept = 0, linetype = "dashed", color = "gray70") +
@@ -1232,7 +1378,7 @@ plot_fc_P_rosavslc_xy <- ggplot(fc_P_rosavslc_xy, aes(x = SLC, y = ROSA)) +
         aes(label = compound),
         size = 3.2, max.overlaps = 10, box.padding = 0.35, seed = 42
     ) +
-    coord_fixed() +
+    coord_fixed(xlim = c(-max_val_p, max_val_p), ylim = c(-max_val_p, max_val_p)) +
     labs(
         title = "🧬 P background — log2FC(CAR vs Mock): ROSA vs SLC",
         x = "SLC (log2FC CAR vs Mock)",
@@ -1242,13 +1388,12 @@ plot_fc_P_rosavslc_xy <- ggplot(fc_P_rosavslc_xy, aes(x = SLC, y = ROSA)) +
     theme(
         plot.title = element_text(face = "bold", size = 16),
         legend.position = "right"
-    ) +
-    scale_x_continuous(limits = c(-21, 10), breaks = seq(-20, 10, 5)) +
-    scale_y_continuous(limits = c(-21, 10), breaks = seq(-20, 10, 5))
+    )
+
 
 ```
 
-# Resistant vs Sensitive
+# ⭐️Resistant vs Sensitive
 
 # for each we have the logFC of CAR vs MOCK (CAR as numerator)
 
@@ -1325,33 +1470,75 @@ print(summary(fc_resistant_vs_sensitive))
 print(head(fc_resistant_vs_sensitive, 10))
 
 
-plot_fc_resistant_vs_sensitive <- ggplot(fc_resistant_vs_sensitive, aes(x = Sensitive, y = Resistant)) +
+# Remove numeric prefix and trim spaces (e.g., "249 Hexadecanoic acid" → "Hexadecanoic acid")
+# Clean compound names (remove numeric prefixes)
+compound_classes <- data_cleaned %>%
+  mutate(
+    clean_compound = stringr::str_trim(stringr::str_remove(compound, "^[0-9]+\\s+")),
+    new_group = case_when(
+      stringr::str_detect(clean_compound, regex("carnitine", ignore_case = TRUE)) ~ "Fatty Acid - Carnitine",
+      Group %in% c("Tracers", "Unsaturated FAs") ~ "Fatty Acids",
+      TRUE ~ as.character(Group)
+    )
+  ) %>%
+  select(clean_compound, new_group) %>%
+  distinct()
+
+
+# Merge using cleaned compound names
+# Merge with new class labels
+fc_resistant_vs_sensitive_annot <- fc_resistant_vs_sensitive %>%
+  left_join(compound_classes, by = c("compound" = "clean_compound")) %>%
+  rename(Group = new_group)
+
+
+
+
+# ─────────────────────────────────────────────
+# 🧭 Compute max value for symmetric scaling
+# ─────────────────────────────────────────────
+max_val_rs <- max(abs(c(fc_resistant_vs_sensitive$Sensitive,
+                        fc_resistant_vs_sensitive$Resistant)), na.rm = TRUE) * 1.1
+
+# ─────────────────────────────────────────────
+# 📈 Final plot with updated symmetric scaling
+# ─────────────────────────────────────────────
+plot_fc_resistant_vs_sensitive <- ggplot(fc_resistant_vs_sensitive_annot, aes(x = Sensitive, y = Resistant)) +
     geom_hline(yintercept = 0, linetype = "dashed", color = "gray70") +
     geom_vline(xintercept = 0, linetype = "dashed", color = "gray70") +
     geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "firebrick") +
-    geom_point(aes(color = sqrt(Sensitive^2 + Resistant^2)), size = 3, alpha = 0.85) +
-    scale_color_gradient2(
-        low = "blue", mid = "gray85", high = "red", midpoint = 0,
-        name = "Magnitude\nlog2FC"
-    ) +
+    geom_point(aes(color = Group), size = 3, alpha = 0.85) +
     geom_text_repel(
-        data = fc_resistant_vs_sensitive %>% filter(abs(Sensitive - Resistant) > 2),
+        data = fc_resistant_vs_sensitive_annot %>%
+            filter(Sensitive < -2 | Sensitive > 2 | Resistant < -2 | Resistant > 2),
         aes(label = compound),
-        size = 3.2, max.overlaps = 10, box.padding = 0.35, seed = 42
+        size = 3.2,
+        max.overlaps = Inf,
+        box.padding = 0.8,         # Increased from 0.6
+        point.padding = 0.8,       # Increased from 0.4
+        force = 3,                 # Slightly stronger repulsion
+        force_pull = 0.1,
+        min.segment.length = 0.2,
+        segment.size = 0.3,
+        segment.curvature = 0.1,
+        segment.angle = 15,
+        segment.ncp = 3,
+        seed = 42
     ) +
     scale_x_continuous(
-        limits = c(min(fc_resistant_vs_sensitive$Sensitive) - 1, max(fc_resistant_vs_sensitive$Sensitive) + 1),
-        breaks = pretty(c(min(fc_resistant_vs_sensitive$Sensitive), max(fc_resistant_vs_sensitive$Sensitive)), n = 6)
+        breaks = seq(-15, 15, by = 5),
+        expand = expansion(mult = 0.05)
     ) +
     scale_y_continuous(
-        limits = c(min(fc_resistant_vs_sensitive$Resistant) - 1, max(fc_resistant_vs_sensitive$Resistant) + 1),
-        breaks = pretty(c(min(fc_resistant_vs_sensitive$Resistant), max(fc_resistant_vs_sensitive$Resistant)), n = 6)
+        breaks = seq(-15, 15, by = 5),
+        expand = expansion(mult = 0.05)
     ) +
-    coord_fixed() +
+    coord_fixed(xlim = c(-max_val_rs, max_val_rs), ylim = c(-max_val_rs, max_val_rs)) +
     labs(
         title = "🧬 Resistant vs Sensitive — log2FC(CAR vs Mock)",
         x = "Mean Sensitive (log2FC CAR vs Mock)",
-        y = "Resistant (log2FC CAR vs Mock)"
+        y = "Resistant (log2FC CAR vs Mock)",
+        color = "Metabolite Class"
     ) +
     theme_classic(base_size = 15) +
     theme(
@@ -1359,13 +1546,247 @@ plot_fc_resistant_vs_sensitive <- ggplot(fc_resistant_vs_sensitive, aes(x = Sens
         legend.position = "right"
     )
 
+
 ```
+
+
+## Heatmap for this?
+
+```{r}
+# ─────────────────────────────────────────────
+# 📦 Load libraries
+# ─────────────────────────────────────────────
+library(dplyr)
+library(tibble)
+library(pheatmap)
+library(RColorBrewer)
+
+# Select and prepare matrix for heatmap
+heatmap_matrix <- fc_resistant_vs_sensitive_annot %>%
+  filter(!is.na(Group)) %>%
+  arrange(Group, compound) %>%
+  column_to_rownames("compound") %>%
+  select(Sensitive, Resistant) %>%
+  as.matrix()
+
+# Factor for row annotation (class group)
+compound_classes_vec <- fc_resistant_vs_sensitive_annot %>%
+  filter(!is.na(Group)) %>%
+  arrange(Group, compound) %>%
+  pull(Group) %>%
+  factor()
+
+
+# Row annotation by metabolite class
+row_ha <- rowAnnotation(
+  Class = compound_classes_vec,
+  col = list(Class = c(
+    "Fatty Acids" = "#1b9e77",
+    "Fatty Acid - Carnitine" = "#d95f02",
+    "TCA Cycle" = "#7570b3"
+  )),
+  show_annotation_name = FALSE
+)
+
+# Define color gradient for log2FC
+logfc_col_fun <- colorRamp2(
+  c(-10, 0, 10),
+  c("blue", "white", "red")
+)
+
+
+# ─────────────────────────────────────────────
+# 🔥 Draw heatmap with pheatmap
+# ─────────────────────────────────────────────
+Heatmap(
+  heatmap_matrix,
+  name = "log2FC",
+  col = logfc_col_fun,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  row_names_gp = gpar(fontsize = 9),
+  column_names_gp = gpar(fontsize = 12),
+  left_annotation = row_ha,
+  row_title = "Metabolites grouped by class",
+  column_title = "CAR vs Mock log2 Fold Change",
+  border = TRUE,
+  heatmap_legend_param = list(
+    at = c(-10, -5, 0, 5, 10),
+    color_bar = "continuous",
+    legend_direction = "vertical"
+  )
+)
+
+# 📁 Save ComplexHeatmap to PDF — Experiment 2 log2FC heatmap
+pdf("experiment_2_log2FC_heatmap.pdf", width = 8, height = 10)
+
+Heatmap(
+    heatmap_matrix,
+    name = "log2FC",
+    col = logfc_col_fun,
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    row_names_gp = gpar(fontsize = 9),
+    column_names_gp = gpar(fontsize = 12),
+    left_annotation = row_ha,
+    row_title = "Metabolites grouped by class",
+    column_title = "CAR vs Mock log2 Fold Change",
+    border = TRUE,
+    heatmap_legend_param = list(
+        at = c(-10, -5, 0, 5, 10),
+        color_bar = "continuous",
+        legend_direction = "vertical"
+    )
+)
+
+dev.off()
+
+
+```
+
+### per sample zscore
+
+```{r}
+# ─────────────────────────────────────────────
+# 📦 Load libraries
+# ─────────────────────────────────────────────
+library(dplyr)
+library(stringr)
+library(tibble)
+library(ComplexHeatmap)
+library(circlize)
+
+# ─────────────────────────────────────────────
+# 🧼 Clean compound names
+# ─────────────────────────────────────────────
+clean_compound_name <- function(name) {
+    str_trim(str_remove(name, "^[0-9]+\\s+"))
+}
+
+# ─────────────────────────────────────────────
+# 🧮 Step 1: Log-transform & z-score across all sample columns
+# ─────────────────────────────────────────────
+zscore_data_exp2 <- data_collapsed %>%
+    filter(label_group == "LABEL") %>%
+    select(compound, starts_with("Experiment_2")) %>%
+    mutate(across(-compound, ~ log2(. + 1))) %>%
+    column_to_rownames("compound") %>%
+    scale(center = TRUE, scale = TRUE) %>%
+    as.data.frame() %>%
+    rownames_to_column("compound")
+
+# ─────────────────────────────────────────────
+# 🔁 Step 2: Average by group using z-scored data
+# ─────────────────────────────────────────────
+zscore_avg_df <- tibble(
+    compound = clean_compound_name(zscore_data_exp2$compound),
+
+    # Sensitive groups
+    C_ROSA = average_by_group(zscore_data_exp2, "^Experiment_2_Cells_C_ROSA_CAR") -
+             average_by_group(zscore_data_exp2, "^Experiment_2_Cells_C_ROSA_Mock"),
+    
+    C_SLC  = average_by_group(zscore_data_exp2, "^Experiment_2_Cells_C_SLC_CAR") -
+             average_by_group(zscore_data_exp2, "^Experiment_2_Cells_C_SLC_Mock"),
+    
+    P_SLC  = average_by_group(zscore_data_exp2, "^Experiment_2_Cells_P_SLC_CAR") -
+             average_by_group(zscore_data_exp2, "^Experiment_2_Cells_P_SLC_Mock"),
+    
+    # Resistant
+    P_ROSA = average_by_group(zscore_data_exp2, "^Experiment_2_Cells_P_ROSA_CAR") -
+             average_by_group(zscore_data_exp2, "^Experiment_2_Cells_P_ROSA_Mock")
+)
+
+# ─────────────────────────────────────────────
+# 📊 Step 3: Build final Sensitive vs Resistant table (mean of sensitive)
+# ─────────────────────────────────────────────
+fc_resistant_vs_sensitive_z <- zscore_avg_df %>%
+    mutate(
+        Sensitive = rowMeans(select(., C_ROSA, C_SLC, P_SLC), na.rm = TRUE),
+        Resistant = P_ROSA
+    ) %>%
+    select(compound, Sensitive, Resistant)
+
+# ─────────────────────────────────────────────
+# 🏷️ Step 4: Annotate compound classes
+# ─────────────────────────────────────────────
+compound_classes <- data_cleaned %>%
+  mutate(
+    clean_compound = str_trim(str_remove(compound, "^[0-9]+\\s+")),
+    new_group = case_when(
+      str_detect(clean_compound, regex("carnitine", ignore_case = TRUE)) ~ "Fatty Acid - Carnitine",
+      Group %in% c("Tracers", "Unsaturated FAs") ~ "Fatty Acids",
+      TRUE ~ as.character(Group)
+    )
+  ) %>%
+  select(clean_compound, new_group) %>%
+  distinct()
+
+# Merge
+fc_resistant_vs_sensitive_z_annot <- fc_resistant_vs_sensitive_z %>%
+  left_join(compound_classes, by = c("compound" = "clean_compound")) %>%
+  rename(Group = new_group)
+
+# ─────────────────────────────────────────────
+# 🔥 Step 5: Generate heatmap with ComplexHeatmap (z-scored logFC)
+# ─────────────────────────────────────────────
+heatmap_matrix <- fc_resistant_vs_sensitive_z_annot %>%
+    filter(!is.na(Group)) %>%
+    arrange(Group, compound) %>%
+    column_to_rownames("compound") %>%
+    select(Sensitive, Resistant) %>%
+    as.matrix()
+
+compound_classes_vec <- fc_resistant_vs_sensitive_z_annot %>%
+    filter(!is.na(Group)) %>%
+    arrange(Group, compound) %>%
+    pull(Group) %>%
+    factor()
+
+row_ha <- rowAnnotation(
+    Class = compound_classes_vec,
+    col = list(Class = c(
+        "Fatty Acids" = "#1b9e77",
+        "Fatty Acid - Carnitine" = "#d95f02",
+        "TCA Cycle" = "#7570b3"
+    )),
+    show_annotation_name = FALSE
+)
+
+z_col_fun <- colorRamp2(
+    c(-2, 0, 2),
+    c("blue", "white", "red")
+)
+
+Heatmap(
+    heatmap_matrix,
+    name = "z-score log2FC",
+    col = z_col_fun,
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    row_names_gp = gpar(fontsize = 9),
+    column_names_gp = gpar(fontsize = 12),
+    left_annotation = row_ha,
+    row_title = "Metabolites grouped by class",
+    column_title = "CAR vs Mock (z-scored per sample before log2FC)",
+    border = TRUE,
+    heatmap_legend_param = list(
+        at = c(-2, -1, 0, 1, 2),
+        color_bar = "continuous",
+        legend_direction = "vertical"
+    )
+)
+
+```
+
+
 
 ```{r}
 # ─────────────────────────────────────────────
 # 💾 Save all Experiment 2 CAR vs Mock summary plots
 # ─────────────────────────────────────────────
-
+# ─────────────────────────────────────────────
+# 💾 Save all summary plots to PDF (RStudio scaling)
+# ─────────────────────────────────────────────
 output_dir <- "Experiment_2_plots"
 if (!dir.exists(output_dir)) dir.create(output_dir)
 
@@ -1376,11 +1797,143 @@ summary_plots <- list(
   "Resistant_vs_Sensitive_log2FC_CARvsMock" = plot_fc_resistant_vs_sensitive
 )
 
+# Define dimensions in inches (converted from 1218 x 1147 px @ 96 dpi)
+width_in <- 1218 / 96     # ≈ 12.7 inches
+height_in <- 1147 / 96    # ≈ 11.95 inches
+
 # Save each plot as high-res PDF
 for (plot_name in names(summary_plots)) {
   ggsave(
     filename = file.path(output_dir, paste0(plot_name, ".pdf")),
     plot = summary_plots[[plot_name]],
+    device = "pdf",
+    width = width_in,
+    height = height_in,
+    dpi = 300,
+    units = "in",
+    bg = "white"
+  )
+}
+
+
+
+
+```
+
+
+# PARENT (unlabeled)
+## Experiment1
+```{r}
+# ─────────────────────────────────────────────
+# 🏗️ Build replicate-level z-scored data (PARENT, Experiment 1)
+# ─────────────────────────────────────────────
+rep_data_parent <- data_collapsed %>%
+    filter(label_group == "PARENT") %>%
+    select(compound, starts_with("Experiment_1")) %>%
+    mutate(compound_clean = clean_compound_name(compound)) %>%
+    filter(compound_clean %in% target_lipids) %>%
+    pivot_longer(
+        cols = starts_with("Experiment_1"),
+        names_to = "sample",
+        values_to = "value"
+    ) %>%
+    mutate(
+        value = as.numeric(value),
+        genotype = case_when(
+            str_detect(sample, "_ROSA_") ~ "ROSA",
+            str_detect(sample, "_SLC_") ~ "SLC",
+            TRUE ~ NA_character_
+        ),
+        background = case_when(
+            str_detect(sample, "_Cells_") ~ "Cells",
+            str_detect(sample, "_Media_") ~ "Media",
+            TRUE ~ NA_character_
+        ),
+        population = case_when(
+            str_detect(sample, "_P_") ~ "P",
+            str_detect(sample, "_C_") ~ "C",
+            TRUE ~ NA_character_
+        )
+    ) %>%
+    filter(!is.na(genotype), !is.na(background)) %>%
+    group_by(compound_clean, background) %>%
+    mutate(z_score = scale(value)[, 1]) %>%
+    ungroup() %>%
+    mutate(replicate = str_extract(sample, "rep[0-9]+")) %>%
+    group_by(compound_clean, genotype, population, background, replicate) %>%
+    summarise(z_score = mean(z_score, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = background, values_from = z_score) %>%
+    filter(!is.na(Cells), !is.na(Media))
+
+# 🧪 Vector of target lipids
+target_lipids <- c("Hexadecanoic acid", "Linoleate", "Octadecenoic acid")
+
+# 📁 Output directory (create if it doesn't exist)
+output_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/blood_canc_disc_reviewer_comments/parent_plots/exp_1_parent"
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+# 🔁 Loop through each lipid
+for (lipid in target_lipids) {
+  cat(glue::glue("\n📊 Plotting & Saving: {lipid} (PARENT, Exp 1)\n"))
+
+  # 🖼️ Generate the plot
+  plot_obj <- plot_lipid_zscore(rep_data_parent, lipid)
+
+  # 🖨️ Print to console
+  print(plot_obj)
+
+  # 💾 Save the plot as PDF
+  file_safe_name <- gsub(" ", "_", lipid)
+  filename <- file.path(output_dir, paste0(file_safe_name, "_zScored_PARENT.pdf"))
+  
+  ggsave(
+    filename = filename,
+    plot = plot_obj,
+    device = "pdf",
+    width = 7,
+    height = 7,
+    dpi = 600,
+    units = "in",
+    bg = "white"
+  )
+}
+
+
+```
+
+avg
+
+```{r}
+
+# ─────────────────────────────────────────────
+# 🧮 Build averaged z-scored data (PARENT, Experiment 1)
+# ─────────────────────────────────────────────
+avg_data_parent <- rep_data_parent %>%
+    group_by(compound_clean, genotype, population) %>%
+    summarise(
+        Cells = mean(Cells, na.rm = TRUE),
+        Media = mean(Media, na.rm = TRUE),
+        .groups = "drop"
+    )
+
+
+# 🔁 Loop through each lipid to plot averaged z-scores
+for (lipid in target_lipids) {
+  cat(glue::glue("\n📊 Plotting & Saving (AVG): {lipid} (PARENT, Exp 1)\n"))
+
+  # 🖼️ Generate plot
+  plot_obj <- plot_lipid_zscore(avg_data_parent, lipid)
+
+  # 🖨️ Print plot to console
+  print(plot_obj)
+
+  # 💾 Save to output dir
+  file_safe_name <- gsub(" ", "_", lipid)
+  filename <- file.path(output_dir, paste0(file_safe_name, "_zScored_avg_PARENT.pdf"))
+
+  ggsave(
+    filename = filename,
+    plot = plot_obj,
     device = "pdf",
     width = 7,
     height = 7,
@@ -1391,3 +1944,610 @@ for (plot_name in names(summary_plots)) {
 }
 
 ```
+
+## Qudrant plot LogFC PARENT Exp1
+
+```{r}
+# ─────────────────────────────────────────────
+# 🧼 Clean compound names
+# ─────────────────────────────────────────────
+clean_compound_name <- function(name) {
+  str_trim(str_remove(name, "^[0-9]+\\s+"))
+}
+
+# ─────────────────────────────────────────────
+# 🔢 Define genotype-background comparisons
+# ─────────────────────────────────────────────
+genotype_pairs <- list(
+  C = list(group1 = "C_SLC", group2 = "C_ROSA"),
+  P = list(group1 = "P_SLC", group2 = "P_ROSA")
+)
+
+# ─────────────────────────────────────────────
+# 🧪 Filter for PARENT compounds
+# ─────────────────────────────────────────────
+data_parent <- data_collapsed %>%
+  filter(label_group == "PARENT")
+
+# 🔁 Log2-transform numeric columns (pseudo-count = 1)
+log_parent <- data_parent
+log_parent[, -c(1, 2)] <- log2(log_parent[, -c(1, 2)] + 1)
+
+# 📊 Helper function: replicate-averaged values
+average_condition <- function(df, genotype, pattern) {
+  cols <- grep(pattern, names(df), value = TRUE)
+  cols <- cols[str_detect(cols, genotype)]
+  rowMeans(df[, cols, drop = FALSE], na.rm = TRUE)
+}
+
+# ─────────────────────────────────────────────
+# 📊 Compute log2FC(ROSA − SLC) for Media and Cells
+# ─────────────────────────────────────────────
+media_contrasts_parent <- list()
+cells_contrasts_parent <- list()
+
+for (grp in names(genotype_pairs)) {
+  g1 <- genotype_pairs[[grp]]$group1  # SLC
+  g2 <- genotype_pairs[[grp]]$group2  # ROSA
+
+  # ── Media ──
+  media_df <- log_parent %>%
+    transmute(
+      compound,
+      SLC = average_condition(., g1, "^Experiment_1_Media_"),
+      ROSA = average_condition(., g2, "^Experiment_1_Media_")
+    ) %>%
+    mutate(diff = ROSA - SLC) %>%
+    arrange(desc(diff)) %>%
+    select(compound, diff) %>%
+    column_to_rownames("compound")
+
+  media_contrasts_parent[[grp]] <- media_df
+
+  # ── Cells ──
+  cells_df <- log_parent %>%
+    transmute(
+      compound,
+      SLC = average_condition(., g1, "^Experiment_1_Cells_"),
+      ROSA = average_condition(., g2, "^Experiment_1_Cells_")
+    ) %>%
+    mutate(diff = ROSA - SLC) %>%
+    arrange(desc(diff)) %>%
+    select(compound, diff) %>%
+    column_to_rownames("compound")
+
+  cells_contrasts_parent[[grp]] <- cells_df
+}
+
+# ─────────────────────────────────────────────
+# 📈 Plot function for quadrant comparison
+# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# 📈 Updated function with dynamic scaling
+# ─────────────────────────────────────────────
+plot_fc_comparison <- function(df, title) {
+  max_val <- max(abs(c(df$C, df$P)), na.rm = TRUE) * 1.1
+
+  ggplot(df, aes(x = C, y = P)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray70") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray70") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "firebrick") +
+    geom_point(aes(color = sqrt(C^2 + P^2)), size = 3, alpha = 0.85) +
+    scale_color_gradient2(
+      low = "blue", mid = "gray85", high = "red", midpoint = 0,
+      name = "Magnitude\nlog2FC"
+    ) +
+    geom_text_repel(
+      data = df %>% filter(abs(C - P) > 1),  # Adjust threshold as needed
+      aes(label = compound),
+      size = 3.2, max.overlaps = 15, box.padding = 0.35, seed = 42
+    ) +
+    coord_fixed(xlim = c(-max_val, max_val), ylim = c(-max_val, max_val)) +
+    labs(
+      title = title,
+      x = "log2FC in C background (ROSA - SLC)",
+      y = "log2FC in P background (ROSA - SLC)"
+    ) +
+    theme_classic(base_size = 15) +
+    theme(
+      plot.title = element_text(face = "bold", size = 16),
+      legend.position = "right"
+    )
+}
+
+
+# ─────────────────────────────────────────────
+# 📊 Merge contrasts & clean compound names
+# ─────────────────────────────────────────────
+media_fc_parent_combined <- media_contrasts_parent$C %>%
+  rename(C = diff) %>%
+  rownames_to_column("compound") %>%
+  inner_join(
+    media_contrasts_parent$P %>%
+      rename(P = diff) %>%
+      rownames_to_column("compound"),
+    by = "compound"
+  ) %>%
+  mutate(compound = clean_compound_name(compound))
+
+cells_fc_parent_combined <- cells_contrasts_parent$C %>%
+  rename(C = diff) %>%
+  rownames_to_column("compound") %>%
+  inner_join(
+    cells_contrasts_parent$P %>%
+      rename(P = diff) %>%
+      rownames_to_column("compound"),
+    by = "compound"
+  ) %>%
+  mutate(compound = clean_compound_name(compound))
+
+# ─────────────────────────────────────────────
+# 💾 Save quadrant plots for PARENT
+# ─────────────────────────────────────────────
+parent_output_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/blood_canc_disc_reviewer_comments/parent_plots/exp_1_parent"
+if (!dir.exists(parent_output_dir)) dir.create(parent_output_dir, recursive = TRUE)
+
+# 📊 Generate
+plot_media_parent <- plot_fc_comparison(media_fc_parent_combined, "📈 Media (PARENT) – log2FC(ROSA vs SLC): C vs P")
+plot_cells_parent <- plot_fc_comparison(cells_fc_parent_combined, "📈 Cells (PARENT) – log2FC(ROSA vs SLC): C vs P")
+
+# 💾 Save
+ggsave(
+  filename = file.path(parent_output_dir, "log2FC_Media_C_vs_P_ROSA_vs_SLC_PARENT.pdf"),
+  plot = plot_media_parent,
+  device = "pdf",
+  width = 8, height = 6, dpi = 600, units = "in", bg = "white"
+)
+
+ggsave(
+  filename = file.path(parent_output_dir, "log2FC_Cells_C_vs_P_ROSA_vs_SLC_PARENT.pdf"),
+  plot = plot_cells_parent,
+  device = "pdf",
+  width = 8, height = 6, dpi = 600, units = "in", bg = "white"
+)
+
+
+```
+
+## Experiment 2
+## Z-Scored Replicate-Level Tracer Uptake (Experiment 2 – PARENT)
+```{r}
+# ─────────────────────────────────────────────
+# 📦 Load packages (if not already loaded)
+# ─────────────────────────────────────────────
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(glue)
+
+# 🧼 Clean compound names
+clean_compound_name <- function(name) {
+  str_trim(str_remove(name, "^[0-9]+\\s+"))
+}
+
+# ─────────────────────────────────────────────
+# 🧪 Target lipids (same as before)
+# ─────────────────────────────────────────────
+target_lipids <- c("Hexadecanoic acid", "Octadecenoic acid", "Linoleate")
+
+# ─────────────────────────────────────────────
+# 🔄 Prepare long-format z-score dataset (PARENT, Exp 2)
+# ─────────────────────────────────────────────
+rep_data_long_exp2_parent <- data_collapsed %>%
+  filter(label_group == "PARENT") %>%
+  select(compound, starts_with("Experiment_2")) %>%
+  mutate(compound_clean = clean_compound_name(compound)) %>%
+  filter(compound_clean %in% target_lipids) %>%
+  pivot_longer(
+    cols = starts_with("Experiment_2"),
+    names_to = "sample",
+    values_to = "value"
+  ) %>%
+  mutate(
+    value = as.numeric(value),
+    genotype = case_when(
+      str_detect(sample, "_ROSA_") ~ "ROSA",
+      str_detect(sample, "_SLC_") ~ "SLC",
+      TRUE ~ NA_character_
+    ),
+    condition = case_when(
+      str_detect(sample, "_P_") ~ "P",
+      str_detect(sample, "_C_") ~ "C",
+      TRUE ~ NA_character_
+    ),
+    treatment = case_when(
+      str_detect(sample, "_CAR_") ~ "CAR",
+      str_detect(sample, "_Mock_") ~ "Mock",
+      TRUE ~ NA_character_
+    ),
+    replicate = str_extract(sample, "rep[0-9]+")
+  ) %>%
+  filter(!is.na(genotype), !is.na(condition), !is.na(treatment), !is.na(replicate)) %>%
+  group_by(compound_clean) %>%
+  mutate(z_score = scale(value)[, 1]) %>%
+  ungroup()
+
+# ─────────────────────────────────────────────
+# 🖼️ Plotting function: CAR vs Mock by replicate
+# ─────────────────────────────────────────────
+plot_exp2_car_vs_mock_parent <- function(df, lipid) {
+  df_sub <- df %>%
+    filter(compound_clean == lipid) %>%
+    pivot_wider(
+      id_cols = c(genotype, condition, replicate),
+      names_from = treatment,
+      values_from = z_score
+    ) %>%
+    filter(!is.na(CAR), !is.na(Mock)) %>%
+    mutate(magnitude = sqrt(CAR^2 + Mock^2))
+
+  lim_range <- max(abs(c(df_sub$CAR, df_sub$Mock)), na.rm = TRUE) * 1.1
+
+  ggplot(df_sub, aes(x = Mock, y = CAR)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray70") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray70") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "gray50", linewidth = 0.8) +
+    geom_point(aes(color = genotype, shape = condition), size = 4.5) +
+    coord_fixed(xlim = c(-lim_range, lim_range), ylim = c(-lim_range, lim_range)) +
+    scale_x_continuous(
+      limits = c(-lim_range, lim_range),
+      breaks = pretty(c(-lim_range, lim_range)),
+      expand = expansion(mult = 0.05)
+    ) +
+    scale_y_continuous(
+      limits = c(-lim_range, lim_range),
+      breaks = pretty(c(-lim_range, lim_range)),
+      expand = expansion(mult = 0.05)
+    ) +
+    labs(
+      title = glue("CAR vs Mock Uptake — {lipid} (Z-score, PARENT)"),
+      x = "Mock (Z-score)",
+      y = "CAR (Z-score)",
+      color = "Genotype",
+      shape = "Condition"
+    ) +
+    theme_minimal(base_size = 15) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      legend.position = "bottom"
+    )
+}
+
+
+# ─────────────────────────────────────────────
+# 💾 Save plots to parent_plots/exp_2_parent
+# ─────────────────────────────────────────────
+output_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/blood_canc_disc_reviewer_comments/parent_plots/exp_2_parent"
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+for (lipid in target_lipids) {
+  plot_obj <- plot_exp2_car_vs_mock_parent(rep_data_long_exp2_parent, lipid)
+
+  file_safe_name <- gsub(" ", "_", lipid)
+  filename <- file.path(output_dir, paste0(file_safe_name, "_zScored_CARvsMock_Exp2.pdf"))
+
+  ggsave(
+    filename = filename,
+    plot = plot_obj,
+    device = "pdf",
+    width = 7,
+    height = 7,
+    dpi = 600,
+    units = "in",
+    bg = "white"
+  )
+}
+
+
+```
+
+### C: ROSA vs SLC PARENT
+##### This is general for both coming
+```{r}
+# ─────────────────────────────────────────────
+# 📦 Load required libraries
+# ─────────────────────────────────────────────
+library(dplyr)
+library(stringr)
+library(tibble)
+library(ggplot2)
+library(ggrepel)
+
+# ─────────────────────────────────────────────
+# 🧼 Clean compound names
+# ─────────────────────────────────────────────
+clean_compound_name <- function(name) {
+  str_trim(str_remove(name, "^[0-9]+\\s+"))
+}
+
+# ─────────────────────────────────────────────
+# 🔁 Averaging helper (PARENT, CAR - Mock)
+# ─────────────────────────────────────────────
+average_by_group <- function(df, group_pattern, genotype) {
+  cols <- grep(group_pattern, names(df), value = TRUE)
+  cols <- cols[str_detect(cols, genotype)]
+  if (length(cols) == 0) return(rep(NA, nrow(df)))
+  rowMeans(df[, cols, drop = FALSE], na.rm = TRUE)
+}
+
+# ─────────────────────────────────────────────
+# 🧮 Build log2-transformed PARENT matrix (Exp2)
+# ─────────────────────────────────────────────
+log_data_exp2_parent <- data_collapsed %>%
+  filter(label_group == "PARENT") %>%
+  select(compound, starts_with("Experiment_2")) %>%
+  mutate(across(-compound, ~ log2(. + 1)))
+
+cat("✅ log_data_exp2_parent dimensions:\n")
+print(dim(log_data_exp2_parent))
+
+```
+
+```{r}
+# ─────────────────────────────────────────────
+# 📊 df: C background, ROSA vs SLC (PARENT)
+# ─────────────────────────────────────────────
+fc_C_parent_rosavslc_xy <- tibble(
+  compound = clean_compound_name(log_data_exp2_parent$compound),
+  SLC = average_by_group(log_data_exp2_parent, "^Experiment_2_Cells_C_SLC_CAR", "C_SLC") -
+        average_by_group(log_data_exp2_parent, "^Experiment_2_Cells_C_SLC_Mock", "C_SLC"),
+  ROSA = average_by_group(log_data_exp2_parent, "^Experiment_2_Cells_C_ROSA_CAR", "C_ROSA") -
+         average_by_group(log_data_exp2_parent, "^Experiment_2_Cells_C_ROSA_Mock", "C_ROSA")
+) %>%
+  mutate(magnitude = sqrt(SLC^2 + ROSA^2))
+
+```
+
+```{r}
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+
+
+# Select top 6 most extreme points
+highlight_labels_C <- fc_C_parent_rosavslc_xy %>%
+    slice_max(magnitude, n = 6)
+
+max_range_C <- max(abs(c(fc_C_parent_rosavslc_xy$SLC, fc_C_parent_rosavslc_xy$ROSA)), na.rm = TRUE) * 1.1
+
+plot_fc_C_parent_rosavslc_xy <- ggplot(fc_C_parent_rosavslc_xy, aes(x = SLC, y = ROSA)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray70") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "firebrick") +
+  geom_point(aes(color = magnitude), size = 3, alpha = 0.85) +
+  scale_color_gradient2(
+    low = "blue", mid = "gray85", high = "red", midpoint = 0,
+    name = "Magnitude\nlog2FC"
+  ) +
+  geom_text_repel(
+    data = highlight_labels_C,
+    aes(label = compound),
+    size = 3.2, max.overlaps = 200, box.padding = 0.4, point.padding = 0.3, seed = 42
+  ) +
+  coord_fixed(xlim = c(-max_range_C, max_range_C), ylim = c(-max_range_C, max_range_C)) +
+  labs(
+    title = "🧬 C background (PARENT) — log2FC(CAR vs Mock): ROSA vs SLC\nTop 6 compounds highlighted by magnitude",
+    x = "SLC (log2FC CAR vs Mock)",
+    y = "ROSA (log2FC CAR vs Mock)"
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    legend.position = "right"
+  )
+
+
+
+ggsave(
+  filename = "/Users/cojulian/Desktop/Tzu_projects/Matt/blood_canc_disc_reviewer_comments/parent_plots/exp_2_parent/log2FC_C_ROSA_vs_SLC_CARvsMock_PARENT.pdf",
+  plot = plot_fc_C_parent_rosavslc_xy,
+  width = 7,
+  height = 7,
+  units = "in",
+  dpi = 600,
+  device = "pdf"
+)
+```
+
+
+#### P: ROSA vs SLC
+```{r}
+# ─────────────────────────────────────────────
+# 📊 df: P background, ROSA vs SLC (PARENT)
+# ─────────────────────────────────────────────
+fc_P_parent_rosavslc_xy <- tibble(
+  compound = clean_compound_name(log_data_exp2_parent$compound),
+  SLC = average_by_group(log_data_exp2_parent, "^Experiment_2_Cells_P_SLC_CAR", "P_SLC") -
+        average_by_group(log_data_exp2_parent, "^Experiment_2_Cells_P_SLC_Mock", "P_SLC"),
+  ROSA = average_by_group(log_data_exp2_parent, "^Experiment_2_Cells_P_ROSA_CAR", "P_ROSA") -
+         average_by_group(log_data_exp2_parent, "^Experiment_2_Cells_P_ROSA_Mock", "P_ROSA")
+) %>%
+  mutate(magnitude = sqrt(SLC^2 + ROSA^2))
+
+
+```
+
+```{r}
+# ─────────────────────────────────────────────
+# 🧮 Add magnitude & select highlights
+# ─────────────────────────────────────────────
+highlight_labels_P <- fc_P_parent_rosavslc_xy %>%
+  slice_max(magnitude, n = 6)
+
+max_range_P <- max(abs(c(fc_P_parent_rosavslc_xy$SLC, fc_P_parent_rosavslc_xy$ROSA)), na.rm = TRUE) * 1.1
+
+plot_fc_P_parent_rosavslc_xy <- ggplot(fc_P_parent_rosavslc_xy, aes(x = SLC, y = ROSA)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray70") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "firebrick") +
+  geom_point(aes(color = magnitude), size = 3, alpha = 0.85) +
+  scale_color_gradient2(
+    low = "blue", mid = "gray85", high = "red", midpoint = 0,
+    name = "Magnitude\nlog2FC"
+  ) +
+  geom_text_repel(
+    data = highlight_labels_P,
+    aes(label = compound),
+    size = 3.2, max.overlaps = Inf, box.padding = 0.4, point.padding = 0.3, seed = 42
+  ) +
+  coord_fixed(xlim = c(-max_range_P, max_range_P), ylim = c(-max_range_P, max_range_P)) +
+  labs(
+    title = "🧬 P background (PARENT) — log2FC(CAR vs Mock): ROSA vs SLC\nTop 6 compounds highlighted by magnitude",
+    x = "SLC (log2FC CAR vs Mock)",
+    y = "ROSA (log2FC CAR vs Mock)"
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    legend.position = "right"
+  )
+
+
+ggsave(
+  filename = "/Users/cojulian/Desktop/Tzu_projects/Matt/blood_canc_disc_reviewer_comments/parent_plots/exp_2_parent/log2FC_P_ROSA_vs_SLC_CARvsMock_PARENT.pdf",
+  plot = plot_fc_P_parent_rosavslc_xy,
+  width = 7,
+  height = 7,
+  units = "in",
+  dpi = 600,
+  device = "pdf"
+)
+```
+
+## # Resistant vs Sensitive
+for each we have the logFC of CAR vs MOCK (CAR as numerator)
+```{r}
+# ─────────────────────────────────────────────
+# 📦 Load libraries
+# ─────────────────────────────────────────────
+library(dplyr)
+library(stringr)
+library(tibble)
+library(ggplot2)
+library(ggrepel)
+
+# ─────────────────────────────────────────────
+# 🧼 Clean compound names
+# ─────────────────────────────────────────────
+clean_compound_name <- function(name) {
+  str_trim(str_remove(name, "^[0-9]+\\s+"))
+}
+
+# ─────────────────────────────────────────────
+# 🔁 Helper: average by group (CAR or Mock)
+# ─────────────────────────────────────────────
+average_by_group <- function(df, pattern) {
+  cols <- grep(pattern, names(df), value = TRUE)
+  if (length(cols) == 0) return(rep(NA, nrow(df)))
+  rowMeans(df[, cols, drop = FALSE], na.rm = TRUE)
+}
+
+# ─────────────────────────────────────────────
+# 🧮 Build log2FC(CAR - Mock) per group (PARENT only)
+# ─────────────────────────────────────────────
+
+# Step 1: log2-transform only PARENT samples
+log_data_exp2_parent <- data_collapsed %>%
+  filter(label_group == "PARENT") %>%
+  select(compound, starts_with("Experiment_2")) %>%
+  mutate(across(-compound, ~ log2(. + 1)))
+
+cat("✅ log_data_exp2_parent dimensions:\n")
+print(dim(log_data_exp2_parent))
+
+# Step 2: Compute log2FC(CAR - Mock) for 4 relevant subgroups
+log2fc_parent_df <- tibble(
+  compound = clean_compound_name(log_data_exp2_parent$compound),
+
+  # Sensitive groups
+  C_ROSA = average_by_group(log_data_exp2_parent, "^Experiment_2_Cells_C_ROSA_CAR") -
+           average_by_group(log_data_exp2_parent, "^Experiment_2_Cells_C_ROSA_Mock"),
+
+  C_SLC  = average_by_group(log_data_exp2_parent, "^Experiment_2_Cells_C_SLC_CAR") -
+           average_by_group(log_data_exp2_parent, "^Experiment_2_Cells_C_SLC_Mock"),
+
+  P_SLC  = average_by_group(log_data_exp2_parent, "^Experiment_2_Cells_P_SLC_CAR") -
+           average_by_group(log_data_exp2_parent, "^Experiment_2_Cells_P_SLC_Mock"),
+
+  # Resistant group
+  P_ROSA = average_by_group(log_data_exp2_parent, "^Experiment_2_Cells_P_ROSA_CAR") -
+           average_by_group(log_data_exp2_parent, "^Experiment_2_Cells_P_ROSA_Mock")
+)
+
+cat("✅ Raw log2FC table (CAR - Mock):\n")
+print(head(log2fc_parent_df, 8))
+
+# Step 3: Compute mean sensitive log2FC and build final df
+fc_parent_resistant_vs_sensitive <- log2fc_parent_df %>%
+  mutate(
+    Sensitive = rowMeans(select(., C_ROSA, C_SLC, P_SLC), na.rm = TRUE),
+    Resistant = P_ROSA
+  ) %>%
+  select(compound, Sensitive, Resistant)
+
+# Step 4: Inspect and plot
+cat("🎯 Final table for Resistant vs Sensitive (PARENT):\n")
+print(summary(fc_parent_resistant_vs_sensitive))
+print(head(fc_parent_resistant_vs_sensitive, 10))
+
+```
+```{r}
+# ─────────────────────────────────────────────
+# 🧮 Add vector magnitude & compute axis range
+# ─────────────────────────────────────────────
+fc_parent_resistant_vs_sensitive <- fc_parent_resistant_vs_sensitive %>%
+  mutate(magnitude = sqrt(Sensitive^2 + Resistant^2))
+
+# Auto-scale based on range of Sensitive and Resistant
+max_range_RS <- max(abs(c(fc_parent_resistant_vs_sensitive$Sensitive, fc_parent_resistant_vs_sensitive$Resistant)), na.rm = TRUE) * 1.1
+
+# Optional: highlight top 6 compounds by magnitude
+highlight_labels_RS <- fc_parent_resistant_vs_sensitive %>%
+  slice_max(magnitude, n = 16)
+
+# ─────────────────────────────────────────────
+# 🖼️ Plot: Resistant vs Sensitive log2FC (PARENT)
+# ─────────────────────────────────────────────
+plot_fc_parent_resistant_vs_sensitive <- ggplot(fc_parent_resistant_vs_sensitive, aes(x = Sensitive, y = Resistant)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray70") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "firebrick") +
+  geom_point(aes(color = magnitude), size = 3, alpha = 0.85) +
+  scale_color_gradient2(
+    low = "blue", mid = "gray85", high = "red", midpoint = 0,
+    name = "Magnitude\nlog2FC"
+  ) +
+  geom_text_repel(
+    data = highlight_labels_RS,
+    aes(label = compound),
+    size = 3.2, max.overlaps = Inf, box.padding = 0.35, point.padding = 0.3, seed = 42
+  ) +
+  coord_fixed(xlim = c(-max_range_RS, max_range_RS), ylim = c(-max_range_RS, max_range_RS)) +
+  labs(
+    title = "🧬 Resistant vs Sensitive — log2FC(CAR vs Mock) (PARENT)",
+    x = "Mean Sensitive (log2FC CAR vs Mock)",
+    y = "Resistant (log2FC CAR vs Mock)"
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    legend.position = "right"
+  )
+
+ggsave(
+  filename = "/Users/cojulian/Desktop/Tzu_projects/Matt/blood_canc_disc_reviewer_comments/parent_plots/exp_2_parent/log2FC_Resistant_vs_Sensitive_PARENT.pdf",
+  plot = plot_fc_parent_resistant_vs_sensitive,
+  width = 7,
+  height = 7,
+  units = "in",
+  dpi = 600,
+  device = "pdf"
+)
+
+```
+
+
+
+
+
