@@ -634,6 +634,304 @@ for (lipid in lipids) {
 
 
 ```
+
+#### annovas Matt's request as of July 9
+
+##### Testing assumptions for t test or wilcoxon
+
+```{r}
+# Load required libraries
+library(dplyr)
+library(rstatix)
+library(glue)
+library(tibble)
+
+# Filter your data
+media_data <- rep_data_summarised_z %>%
+    filter(background == "Media") %>%
+    mutate(group = paste(genotype, population, sep = "_")) %>%
+    filter(group %in% c("ROSA_P", "SLC_P", "ROSA_C", "SLC_C")) %>%
+    droplevels()
+
+# Compounds and comparisons
+compounds_to_check <- c("Hexadecanoic acid", "Linoleate", "Octadecenoic acid")
+comparisons <- list(
+    c("ROSA_P", "SLC_P"),
+    c("ROSA_P", "ROSA_C"),
+    c("ROSA_P", "SLC_C"),
+    c("ROSA_C", "SLC_C")
+)
+
+# Initialize results list
+assumption_results <- list()
+
+# Loop through each compound and comparison
+for (compound in compounds_to_check) {
+    df_compound <- media_data %>% filter(compound_clean == compound)
+    
+    for (pair in comparisons) {
+        grp1 <- pair[1]
+        grp2 <- pair[2]
+        
+        df_pair <- df_compound %>% filter(group %in% c(grp1, grp2))
+        
+        # Shapiro-Wilk test for normality (per group)
+        shapiro1 <- df_pair %>% filter(group == grp1) %>% shapiro_test(z_score)
+        shapiro2 <- df_pair %>% filter(group == grp2) %>% shapiro_test(z_score)
+        
+        # Variance test (F-test)
+        var_test <- var.test(z_score ~ group, data = df_pair)
+        
+        # Summary stats
+        summary_stats <- df_pair %>%
+            group_by(group) %>%
+            summarise(n = n(), mean = mean(z_score), sd = sd(z_score), .groups = "drop")
+        
+        # Store results
+        assumption_results[[length(assumption_results) + 1]] <- tibble(
+            Compound = compound,
+            Comparison = glue("{grp1} vs. {grp2}"),
+            `Shapiro p-value (grp1)` = signif(shapiro1$p, 4),
+            `Shapiro p-value (grp2)` = signif(shapiro2$p, 4),
+            `Variance p-value` = signif(var_test$p.value, 4),
+            `Equal Variance?` = ifelse(var_test$p.value > 0.05, "Yes", "No"),
+            `Normal grp1?` = ifelse(shapiro1$p > 0.05, "Yes", "No"),
+            `Normal grp2?` = ifelse(shapiro2$p > 0.05, "Yes", "No")
+        )
+    }
+}
+
+# Combine into a single data frame
+assumption_df <- bind_rows(assumption_results)
+
+# Print the final table
+print(assumption_df)
+
+
+
+```
+###### Runnin t-test and wilcoxon for Media
+```{r}
+# Load required libraries
+library(dplyr)
+library(rstatix)
+library(glue)
+library(tibble)
+
+# Filter your data: MEDIA only
+media_data <- rep_data_summarised_z %>%
+    filter(background == "Media") %>%
+    mutate(group = paste(genotype, population, sep = "_")) %>%
+    filter(group %in% c("ROSA_P", "SLC_P", "ROSA_C", "SLC_C")) %>%
+    droplevels()
+
+# Define compounds and pairwise comparisons
+compounds_to_check <- c("Hexadecanoic acid", "Linoleate", "Octadecenoic acid")
+comparisons <- list(
+    c("ROSA_P", "SLC_P"),
+    c("ROSA_P", "ROSA_C"),
+    c("ROSA_P", "SLC_C"),
+    c("ROSA_C", "SLC_C")
+)
+
+# ────────────────────────────────
+# Run t-tests with Cohen's d
+# ────────────────────────────────
+ttest_media_list <- list()
+
+for (compound in compounds_to_check) {
+    df_compound <- media_data %>% filter(compound_clean == compound)
+    
+    for (pair in comparisons) {
+        grp1 <- pair[1]
+        grp2 <- pair[2]
+        
+        df_pair <- df_compound %>% filter(group %in% c(grp1, grp2))
+        
+        ttest <- t_test(df_pair, z_score ~ group, var.equal = TRUE) %>% slice(1)
+        effect <- cohens_d(df_pair, z_score ~ group, var.equal = TRUE) %>% slice(1)
+        
+        ttest_media_list[[length(ttest_media_list) + 1]] <- tibble(
+            Compound = compound,
+            Comparison = glue("{grp1} vs. {grp2}"),
+            `t-statistic` = signif(ttest$statistic, 4),
+            `t p-value` = signif(ttest$p, 4),
+            `t Significant` = ifelse(ttest$p < 0.05, "Yes", "No"),
+            `Cohen's d` = signif(effect$effsize, 3)
+        )
+    }
+}
+
+ttest_media_df <- bind_rows(ttest_media_list)
+
+# ────────────────────────────────
+# Run Wilcoxon tests with effect size r
+# ────────────────────────────────
+wilcox_media_list <- list()
+
+for (compound in compounds_to_check) {
+    df_compound <- media_data %>% filter(compound_clean == compound)
+    
+    for (pair in comparisons) {
+        grp1 <- pair[1]
+        grp2 <- pair[2]
+        
+        df_pair <- df_compound %>% filter(group %in% c(grp1, grp2))
+        
+        wilcox <- wilcox_test(df_pair, z_score ~ group) %>% slice(1)
+        effect <- wilcox_effsize(df_pair, z_score ~ group) %>% slice(1)
+        
+        wilcox_media_list[[length(wilcox_media_list) + 1]] <- tibble(
+            Compound = compound,
+            Comparison = glue("{grp1} vs. {grp2}"),
+            `W-statistic` = signif(wilcox$statistic, 4),
+            `W p-value` = signif(wilcox$p, 4),
+            `W Significant` = ifelse(wilcox$p < 0.05, "Yes", "No"),
+            `r` = signif(effect$effsize, 3)
+        )
+    }
+}
+
+wilcox_media_df <- bind_rows(wilcox_media_list)
+
+# ────────────────────────────────
+# Combine both results
+# ────────────────────────────────
+combined_media_results_df <- ttest_media_df %>%
+    left_join(wilcox_media_df, by = c("Compound", "Comparison"))
+
+# Print the final combined MEDIA table
+print(combined_media_results_df)
+
+```
+
+##### The same for Cells only
+```{r}
+# Load required libraries
+library(dplyr)
+library(rstatix)
+library(glue)
+library(tibble)
+
+# Filter for "Cells" data
+cells_data <- rep_data_summarised_z %>%
+    filter(background == "Cells") %>%
+    mutate(group = paste(genotype, population, sep = "_")) %>%
+    filter(group %in% c("ROSA_P", "SLC_P", "ROSA_C", "SLC_C")) %>%
+    droplevels()
+
+# Compounds and comparisons
+compounds_to_check <- c("Hexadecanoic acid", "Linoleate", "Octadecenoic acid")
+comparisons <- list(
+    c("ROSA_P", "SLC_P"),
+    c("ROSA_P", "ROSA_C"),
+    c("ROSA_P", "SLC_C"),
+    c("ROSA_C", "SLC_C")
+)
+
+# ────────────────────────────────
+# Run t-tests with Cohen's d
+# ────────────────────────────────
+ttest_cells_list <- list()
+
+for (compound in compounds_to_check) {
+    df_compound <- cells_data %>% filter(compound_clean == compound)
+    
+    for (pair in comparisons) {
+        grp1 <- pair[1]
+        grp2 <- pair[2]
+        
+        df_pair <- df_compound %>% filter(group %in% c(grp1, grp2))
+        
+        # Run t-test and Cohen’s d
+        ttest <- t_test(df_pair, z_score ~ group, var.equal = TRUE) %>% slice(1)
+        effect <- cohens_d(df_pair, z_score ~ group, var.equal = TRUE) %>% slice(1)
+        
+        ttest_cells_list[[length(ttest_cells_list) + 1]] <- tibble(
+            Compound = compound,
+            Comparison = glue("{grp1} vs. {grp2}"),
+            `t-statistic` = signif(ttest$statistic, 4),
+            `t p-value` = signif(ttest$p, 4),
+            `t Significant` = ifelse(ttest$p < 0.05, "Yes", "No"),
+            `Cohen's d` = signif(effect$effsize, 3)
+        )
+    }
+}
+
+ttest_cells_df <- bind_rows(ttest_cells_list)
+
+# ────────────────────────────────
+# Run Wilcoxon with effect size (r)
+# ────────────────────────────────
+wilcox_cells_list <- list()
+
+for (compound in compounds_to_check) {
+    df_compound <- cells_data %>% filter(compound_clean == compound)
+    
+    for (pair in comparisons) {
+        grp1 <- pair[1]
+        grp2 <- pair[2]
+        
+        df_pair <- df_compound %>% filter(group %in% c(grp1, grp2))
+        
+        wilcox <- wilcox_test(df_pair, z_score ~ group) %>% slice(1)
+        effect <- wilcox_effsize(df_pair, z_score ~ group) %>% slice(1)
+        
+        wilcox_cells_list[[length(wilcox_cells_list) + 1]] <- tibble(
+            Compound = compound,
+            Comparison = glue("{grp1} vs. {grp2}"),
+            `W-statistic` = signif(wilcox$statistic, 4),
+            `W p-value` = signif(wilcox$p, 4),
+            `W Significant` = ifelse(wilcox$p < 0.05, "Yes", "No"),
+            `r` = signif(effect$effsize, 3)
+        )
+    }
+}
+
+wilcox_cells_df <- bind_rows(wilcox_cells_list)
+
+# ────────────────────────────────
+# Merge t-test and Wilcoxon results
+# ────────────────────────────────
+combined_cells_results_df <- ttest_cells_df %>%
+    left_join(wilcox_cells_df, by = c("Compound", "Comparison"))
+
+# Print the final combined table for "Cells"
+print(combined_cells_results_df)
+
+```
+###### Combining and saving
+```{r}
+# Add a Background column to each dataset
+combined_media_results_df <- combined_media_results_df %>%
+    mutate(Background = "Media")
+
+combined_cells_results_df <- combined_cells_results_df %>%
+    mutate(Background = "Cells")
+
+# Combine both into a single dataframe
+combined_all_results_df <- bind_rows(combined_media_results_df, combined_cells_results_df)
+
+# Optional: Reorder columns for readability
+combined_all_results_df <- combined_all_results_df %>%
+    select(Background, Compound, Comparison, `t-statistic`, `t p-value`, `t Significant`,
+           `Cohen's d`, `W-statistic`, `W p-value`, `W Significant`, r)
+
+# Print the final combined table
+print(combined_all_results_df)
+
+# Create the directory if it doesn't exist
+if (!dir.exists("3_lipids_stats")) {
+  dir.create("3_lipids_stats")
+}
+
+# Save the combined results table
+write.csv(combined_all_results_df, file = "3_lipids_stats/combined_lipid_stats.csv", row.names = FALSE)
+
+```
+
+
+
 ### Matt asked for Genotype Specific zscored_avg_data_wide for Genotype-Averaged Z-scores
 
 
@@ -681,14 +979,19 @@ zscored_avg_data_wide <- data_collapsed %>%
 cat("✅ Z-scored averaged genotype-level data:\n")
 print(zscored_avg_data_wide)
 
-# ─────────────────────────────────────────────
-# 📈 New plot function (no coord_fixed)
-# ─────────────────────────────────────────────
-plot_lipid_zscore_avg <- function(df, compound_name) {
+
+# Get global max value across all target lipids (Cells and Media Z-scores)
+global_max_val <- zscored_avg_data_wide %>%
+  filter(compound_clean %in% target_lipids) %>%
+  select(Cells, Media) %>%
+  summarise(across(everything(), ~ max(abs(.), na.rm = TRUE))) %>%
+  unlist() %>%
+  max() * 1.1  # Add small buffer
+
+
+
+plot_lipid_zscore_avg <- function(df, compound_name, axis_limit) {
   lipid_df <- df %>% filter(compound_clean == compound_name)
-  
-  # Compute max range across both axes, with buffer
-  max_val <- max(abs(c(lipid_df$Cells, lipid_df$Media)), na.rm = TRUE) * 1.1
 
   cat(glue::glue("\n🎯 Plotting {compound_name} (avg z-score):\n"))
   print(dim(lipid_df))
@@ -697,11 +1000,11 @@ plot_lipid_zscore_avg <- function(df, compound_name) {
     geom_point(aes(color = genotype, shape = population), size = 4.5) +
     geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "gray50", linewidth = 0.8) +
     scale_x_continuous(
-      limits = c(-max_val, max_val),
+      limits = c(-axis_limit, axis_limit),
       expand = expansion(mult = 0)
     ) +
     scale_y_continuous(
-      limits = c(-max_val, max_val),
+      limits = c(-axis_limit, axis_limit),
       expand = expansion(mult = 0)
     ) +
     coord_fixed() +
@@ -738,27 +1041,26 @@ print(plot3)
 output_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/blood_canc_disc_reviewer_comments/experiment_1_plots"
 if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 
-# 💾 Guardar y mostrar gráficos
 for (lipid in target_lipids) {
-    plot_obj <- plot_lipid_zscore_avg(zscored_avg_data_wide, lipid)
+  plot_obj <- plot_lipid_zscore_avg(zscored_avg_data_wide, lipid, global_max_val)
 
-    # Mostrar el gráfico en pantalla
-    print(plot_obj)
+  # Display
+  print(plot_obj)
 
-    # Guardar el gráfico como PDF
-    file_safe_name <- gsub(" ", "_", lipid)
-    filename <- paste0(output_dir, "/", file_safe_name, "_zScored_avg.pdf")
+  # Save
+  file_safe_name <- gsub(" ", "_", lipid)
+  filename <- file.path(output_dir, paste0(file_safe_name, "_zScored_avg.pdf"))
 
-    ggsave(
-        filename = filename,
-        plot = plot_obj,
-        device = "pdf",
-        width = 7,
-        height = 7,
-        dpi = 600,
-        units = "in",
-        bg = "white"
-    )
+  ggsave(
+    filename = filename,
+    plot = plot_obj,
+    device = "pdf",
+    width = 7,
+    height = 7,
+    dpi = 600,
+    units = "in",
+    bg = "white"
+  )
 }
 
 
@@ -1618,7 +1920,7 @@ Heatmap(
 )
 
 # 📁 Save ComplexHeatmap to PDF — Experiment 2 log2FC heatmap
-pdf("experiment_2_log2FC_heatmap.pdf", width = 8, height = 10)
+pdf("Experiment_2_plots/experiment_2_log2FC_heatmap.pdf", width = 8, height = 10)
 
 Heatmap(
     heatmap_matrix,
